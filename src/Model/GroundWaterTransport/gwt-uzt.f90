@@ -731,22 +731,50 @@ contains
 
   !> @brief Q617: retardation factor for one UZT feature at the current water content.
   !!
-  !! R = 1 + rhob*Kd/theta + (a_aw/theta)*Kaw, a_aw = 6*(1-por)*(1-Sw)/d50, Sw = theta/por.
-  !! Matches publication/pfas-vadose-end-members/research/figures/decision_surface_uncertainty.py:63
-  !! by construction. LINEAR sorption only -- FREUNDLICH/LANGMUIR are nonlinear (the isotherm
-  !! slope depends on concentration, so a single constant R cannot represent them the way
-  !! MST's per-node isotherm-derivative linearization does) and are refused with a loud error
-  !! rather than silently computing a wrong answer; that generalization is the next increment.
-  !! theta is v/Vcell using the CURRENT water volume, so this is naturally per-timestep --
-  !! that is MT3D-USGS eq. 24's "R updated for each transport time step" for free, not an
-  !! approximation of it (Lane P's sizing fact ii).
+  !! R = 1 + rhob*Kd/theta_m + (a_aw/theta_m)*Kaw, a_aw = 6*(1-por)*(1-Sw)/d50, Sw = theta_t/por.
+  !!
+  !! TWO WATER CONTENTS, AND THEY ARE NOT INTERCHANGEABLE -- this is the Finding 36 repair and
+  !! the reason a blind revert of 8fadf65 was refused:
+  !!
+  !!   theta_m (MOBILE, v/Vcell) is the PARTITIONING denominator. R is multiplied back by the
+  !!     MOBILE water volume in uzt_stor_term, so every /theta_m here cancels exactly and the
+  !!     stored solid-phase mass comes out rhob*Kd*Vcell*c -- INDEPENDENT of water content,
+  !!     which is the one thing sorbed mass on a grain surface must be. Put theta_t in this
+  !!     denominator (8fadf65 did) and the cancellation is partial: the sorbed term becomes
+  !!     rhob*Kd*Vcell*c*(theta_m/theta_t), 42% short at this project's column and -> 0 as the
+  !!     profile dries, i.e. a drier soil sorbing LESS. That is Finding 36.
+  !!
+  !!   theta_t (TOTAL, theta_m + thtr) is the SATURATION. Sw = theta_t/por is physical wetness,
+  !!     and residual water wets grains whether or not it drains, so a_aw must see it. Passing
+  !!     theta_m here (the pre-8fadf65 code did) reports the column drier than it is and
+  !!     OVERSTATES the air-water interfacial area. 8fadf65 was RIGHT about this half; it
+  !!     simply applied the correction to the partitioning denominator as well, where it does
+  !!     not belong. Repairing the mass by reverting wholesale would re-break the saturation --
+  !!     the same one-half-of-an-expression error in the opposite direction.
+  !!
+  !! The a_aw term cancels the same way: (a_aw/theta_m)*Kaw * theta_m*Vcell = a_aw*Kaw*Vcell,
+  !! also water-content independent, with a_aw itself carrying the theta_t dependence it should.
+  !!
+  !! decision_surface_uncertainty.py:63 uses a SINGLE theta for both roles, so it agrees with
+  !! this only at thtr = 0 and cannot arbitrate between them; the earlier "matches by
+  !! construction" claim in this docstring was therefore too strong and is withdrawn.
+  !!
+  !! LINEAR sorption only -- FREUNDLICH/LANGMUIR are nonlinear (the isotherm slope depends on
+  !! concentration, so a single constant R cannot represent them the way MST's per-node
+  !! isotherm-derivative linearization does) and are refused with a loud error rather than
+  !! silently computing a wrong answer; that generalization is the next increment.
+  !! Both water contents are the CURRENT step's, so this is naturally per-timestep -- that is
+  !! MT3D-USGS eq. 24's "R updated for each transport time step" for free (Lane P's sizing
+  !! fact ii). vcell is carried for that sizing note and for future area-based terms; it is
+  !! not read here.
   !<
-  function uzt_retardation(this, n, vcell, theta) result(r)
+  function uzt_retardation(this, n, vcell, theta_m, theta_t) result(r)
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: n
     real(DP), intent(in) :: vcell !< feature cell/reference volume
-    real(DP), intent(in) :: theta !< current water content (v/vcell)
+    real(DP), intent(in) :: theta_m !< MOBILE water content (v/vcell) -- partitioning denominator
+    real(DP), intent(in) :: theta_t !< TOTAL water content (theta_m + thtr) -- saturation only
     ! -- local
     real(DP) :: r
     real(DP) :: a_aw, sw
@@ -759,8 +787,8 @@ contains
     case (SORPTION_OFF)
       ! -- no solid-phase term
     case (SORPTION_LINEAR)
-      if (theta > DZERO) then
-        r = r + this%bulk_density(n) * this%distcoef(n) / theta
+      if (theta_m > DZERO) then
+        r = r + this%bulk_density(n) * this%distcoef(n) / theta_m
       end if
     case default
       write (errmsg, '(a)') &
@@ -772,23 +800,36 @@ contains
     end select
     !
     if (this%iawisrb == 1) then
-      if (theta > DZERO .and. this%por(n) > DZERO .and. this%d50(n) > DZERO) then
-        sw = theta / this%por(n)
+      if (theta_m > DZERO .and. this%por(n) > DZERO .and. this%d50(n) > DZERO) then
+        ! Sw is PHYSICAL wetness and takes theta_t; the 1/theta_m that follows is the
+        ! partitioning denominator and cancels against the mobile volume. See the docstring.
+        sw = theta_t / this%por(n)
         a_aw = 6.0_DP * (DONE - this%por(n)) * (DONE - sw) / this%d50(n)
-        r = r + (a_aw / theta) * this%kaw(n)
+        r = r + (a_aw / theta_m) * this%kaw(n)
       end if
     end if
   end function uzt_retardation
 
   !> @brief Q617: UZT storage term, overriding TspAptType%apt_stor_term to scale the stored
-  !! water volume by the retardation factor -- MT3D-USGS eq. 25
-  !! (Vcell*R^n*theta_w^n*dC/dt). v1 is the CURRENT water volume from apt_get_volumes, so
-  !! theta = v1/vcell (and v0/vcell for the prior step) is already per-timestep; scaling v0
-  !! and v1 independently by their own timestep's R is what makes eq. 24's time-varying R
-  !! fall out of the existing structure (Lane P's sizing fact ii, verified against
-  !! tsp-apt.f90:2256 before this was written). With isrb=OFF and iawisrb=0,
-  !! uzt_retardation returns 1.0 and this is byte-identical to the inherited apt_stor_term --
-  !! that identity IS acceptance test (b)'s control.
+  !! MOBILE water volume by the retardation factor. v1 is the CURRENT mobile water volume
+  !! from apt_get_volumes, so theta_m = v1/vcell (and v0/vcell for the prior step) is already
+  !! per-timestep; scaling v0 and v1 independently by their own timestep's R is what makes
+  !! eq. 24's time-varying R fall out of the existing structure (Lane P's sizing fact ii,
+  !! verified against tsp-apt.f90:2256 before this was written). With isrb=OFF and
+  !! iawisrb=0, uzt_retardation returns 1.0 and this is byte-identical to the inherited
+  !! apt_stor_term -- that identity IS acceptance test (b)'s control, and preserving it is
+  !! why the Finding 36 repair keeps the MOBILE volume here instead of moving to a total one.
+  !!
+  !! WHAT R*v_m EXPANDS TO, which is the property to check rather than R itself:
+  !!   (1 + rhob*Kd/theta_m) * theta_m*Vcell  =  theta_m*Vcell  +  rhob*Kd*Vcell
+  !! aqueous on mobile water (stock MF6 UZT's transport, unchanged by this patch) plus a
+  !! solid-phase term with NO water content in it. A within-code ratio cannot see whether
+  !! that second term is right -- it is R by construction -- so the acceptance row for this
+  !! is a MASS row: sorbed = rhob*Kd, 1.6500 repaired against 0.9619 under 8fadf65, and the
+  !! defect's signature is that it worsens on drying (0.1500 at theta_m 0.0050).
+  !!
+  !! This docstring previously read "theta = v1/vcell" while the body computed v/vcell+thtr.
+  !! The docstring was right and the code was wrong; they are back in agreement.
   !!
   !! MASS BALANCE (work item 3): this function's rrate becomes this%qsto(n), the package's
   !! STORAGE budget term (tsp-apt.f90:942-947) -- so scaling v0/v1 here makes STORAGE report
@@ -826,12 +867,12 @@ contains
       vcell = this%uzt_cellvol(n1)
       if (vcell > DZERO) then
         ! v0/v1 are MOBILE water volumes (gwf-uzf.f90:3014 subtracts thtr and says so in its
-        ! own comment). Add the residual back to get TOTAL volumetric water content, which is
-        ! what equilibrium sorption partitions against and what MT3D-USGS eq. 24 uses. Left
-        ! as-is this inherits mobile theta from an API's convenience -- a physics choice
-        ! nobody made deliberately, and a 25% error against the literature convention.
-        r0 = this%uzt_retardation(n1, vcell, v0 / vcell + this%thtr(n1))
-        r1 = this%uzt_retardation(n1, vcell, v1 / vcell + this%thtr(n1))
+        ! own comment), and R is multiplied back by those SAME mobile volumes below. So the
+        ! partitioning denominator MUST be mobile theta for rhob*Kd*Vcell to survive intact;
+        ! thtr is passed separately as the saturation input, NOT folded into the denominator.
+        ! That folding was 8fadf65 and it is Finding 36.
+        r0 = this%uzt_retardation(n1, vcell, v0 / vcell, v0 / vcell + this%thtr(n1))
+        r1 = this%uzt_retardation(n1, vcell, v1 / vcell, v1 / vcell + this%thtr(n1))
       else
         r0 = DONE
         r1 = DONE
