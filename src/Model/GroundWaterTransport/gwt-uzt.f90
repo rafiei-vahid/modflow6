@@ -70,6 +70,16 @@ module GwtUztModule
     real(DP), dimension(:), pointer, contiguous :: por => null() ! total porosity, per feature (needed for theta/por = Sw)
     real(DP), dimension(:), pointer, contiguous :: kaw => null() ! air-water interfacial partition coefficient, per feature
     real(DP), dimension(:), pointer, contiguous :: d50 => null() ! median grain diameter, per feature
+    ! Residual water content. apt_get_volumes returns the MOBILE water volume -- gwf-uzf.f90
+    ! :3014 computes it as thick*(wcnew - thtr)*area and its own comment says "mobile water
+    ! volume". So theta_mobile = v/vcell and theta_TOTAL = theta_mobile + thtr. Sorption
+    ! equilibrates with all aqueous water touching the grains, not only the mobile fraction,
+    ! and total theta is also what MT3D-USGS eq. 24 uses -- so the default divides by TOTAL
+    ! theta and this input is what makes that conversion explicit rather than inherited.
+    real(DP), dimension(:), pointer, contiguous :: thtr => null()
+    ! GWF cell volume per UZT feature, so theta = water_volume / cell_volume. Filled once from
+    ! the GWF budget term (id1 = feature, id2 = gwf node) the first time it is needed.
+    real(DP), dimension(:), pointer, contiguous :: cellvol => null()
 
   contains
 
@@ -95,6 +105,7 @@ module GwtUztModule
     procedure :: apt_read_cvs => uzt_read_cvs
     procedure :: apt_stor_term => uzt_stor_term
     procedure :: uzt_retardation
+    procedure :: uzt_cellvol
 
   end type GwtUztType
 
@@ -634,6 +645,8 @@ contains
     call mem_deallocate(this%por)
     call mem_deallocate(this%kaw)
     call mem_deallocate(this%d50)
+    call mem_deallocate(this%thtr)
+    call mem_deallocate(this%cellvol)
     !
     ! -- deallocate scalars in TspAptType
     call this%TspAptType%bnd_da()
@@ -682,6 +695,39 @@ contains
       call this%TspAptType%bnd_options(option, found)
     end select
   end subroutine uzt_options
+
+  !> @brief Q617: GWF cell volume for one UZT feature, cached.
+  !!
+  !! theta = water volume / CELL volume, so the storage-term override needs the cell volume
+  !! and not the water volume it is handed. The mapping feature -> GWF node lives in the GWF
+  !! budget term (id1 = feature, id2 = node), and the volume is area*(top-bot), the same form
+  !! gwt-mst.f90 uses. Walked once per feature and cached; the budget list does not move.
+  !<
+  function uzt_cellvol(this, n) result(vcell)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    ! -- local
+    real(DP) :: vcell
+    integer(I4B) :: i, ifeat, node
+    !
+    vcell = DZERO
+    if (n < 1 .or. n > this%ncv) return
+    if (this%cellvol(n) > DZERO) then
+      vcell = this%cellvol(n)
+      return
+    end if
+    if (this%idxbudgwf == 0) return
+    do i = 1, this%flowbudptr%budterm(this%idxbudgwf)%nlist
+      ifeat = this%flowbudptr%budterm(this%idxbudgwf)%id1(i)
+      node = this%flowbudptr%budterm(this%idxbudgwf)%id2(i)
+      if (ifeat < 1 .or. ifeat > this%ncv) cycle
+      if (node < 1) cycle
+      this%cellvol(ifeat) = this%dis%area(node) * &
+                            (this%dis%top(node) - this%dis%bot(node))
+    end do
+    vcell = this%cellvol(n)
+  end function uzt_cellvol
 
   !> @brief Q617: retardation factor for one UZT feature at the current water content.
   !!
@@ -771,10 +817,21 @@ contains
     c1 = this%xnewpak(n1)
     !
     if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
-      vcell = max(v0, v1) ! reference volume for theta; v0/v1 already ARE feature water volumes
+      ! theta = WATER volume / CELL volume. v0/v1 from apt_get_volumes are the water volumes,
+      ! so the denominator must be the GWF cell volume. An earlier version used
+      ! max(v0,v1) here, which made theta identically ~1.0: the AWI area term then saw
+      ! Sw = theta/por = 2.5 > 1, flipped sign, and SPED transport up. Measured 2.5720 and
+      ! 1.5110 against the 2.600 and 1.520 that theta=1 predicts -- the acceptance matrix
+      ! caught it and the pre-registered numbers identified it.
+      vcell = this%uzt_cellvol(n1)
       if (vcell > DZERO) then
-        r0 = this%uzt_retardation(n1, vcell, v0 / vcell)
-        r1 = this%uzt_retardation(n1, vcell, v1 / vcell)
+        ! v0/v1 are MOBILE water volumes (gwf-uzf.f90:3014 subtracts thtr and says so in its
+        ! own comment). Add the residual back to get TOTAL volumetric water content, which is
+        ! what equilibrium sorption partitions against and what MT3D-USGS eq. 24 uses. Left
+        ! as-is this inherits mobile theta from an API's convenience -- a physics choice
+        ! nobody made deliberately, and a 25% error against the literature convention.
+        r0 = this%uzt_retardation(n1, vcell, v0 / vcell + this%thtr(n1))
+        r1 = this%uzt_retardation(n1, vcell, v1 / vcell + this%thtr(n1))
       else
         r0 = DONE
         r1 = DONE
@@ -833,6 +890,8 @@ contains
     call mem_allocate(this%por, this%ncv, 'POR', this%memoryPath)
     call mem_allocate(this%kaw, this%ncv, 'KAW', this%memoryPath)
     call mem_allocate(this%d50, this%ncv, 'D50', this%memoryPath)
+    call mem_allocate(this%thtr, this%ncv, 'THTR', this%memoryPath)
+    call mem_allocate(this%cellvol, this%ncv, 'CELLVOL', this%memoryPath)
     !
     if (this%imatrows == 0) then
       call mem_allocate(this%iboundpak, this%ncv, 'IBOUND', this%memoryPath)
@@ -852,6 +911,8 @@ contains
       this%por(n) = DZERO
       this%kaw(n) = DZERO
       this%d50(n) = DZERO
+      this%thtr(n) = DZERO
+      this%cellvol(n) = DZERO
       if (this%imatrows == 0) then
         this%iboundpak(n) = 1
         this%xnewpak(n) = DEP20
@@ -903,6 +964,7 @@ contains
         !    unpatched binary, which is the control acceptance tests (b) and (e) rest on.
         if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
           this%por(n) = this%parser%GetDouble()
+          this%thtr(n) = this%parser%GetDouble()
         end if
         if (this%isrb /= SORPTION_OFF) then
           this%bulk_density(n) = this%parser%GetDouble()

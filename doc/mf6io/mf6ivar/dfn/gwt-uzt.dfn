@@ -285,7 +285,7 @@ description is a text keyword to indicate that air-water interfacial (AWI) sorpt
 
 block packagedata
 name packagedata
-type recarray ifno strt por bulk_density distcoef sp2 kaw d50 aux boundname
+type recarray ifno strt por thtr bulk_density distcoef sp2 kaw d50 aux boundname
 shape (maxbound)
 reader urword
 longname
@@ -311,6 +311,17 @@ in_record true
 reader urword
 longname starting UZF cell concentration
 description real value that defines the starting concentration for the unsaturated zone flow cell.
+
+block packagedata
+name thtr
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname residual water content (Q617)
+description real value that defines the residual water content for this UZF cell, matching the THTR supplied to the UZF package.  Present ONLY when SORPTION or AWI_SORPTION is specified in the OPTIONS block.  It exists to make the water-content convention EXPLICIT rather than inherited: the volume this package receives from the flow model is the MOBILE water volume (gwf-uzf.f90 computes it as thick*(wcnew - thtr)*area and labels it "mobile water volume"), so theta_mobile = volume/cell_volume and THTR is added back to obtain the TOTAL volumetric water content.  Retardation is divided by TOTAL water content, because equilibrium sorption partitions against all aqueous water in contact with the solid -- residual water is still aqueous and still touching the grains -- and because total water content is the convention of MT3D-USGS equation 24, without which a cross-code comparison disagrees by theta/(theta-thtr) for a purely definitional reason.  Supplying 0.0 here reproduces the mobile-water convention.
 
 block packagedata
 name bulk_density
