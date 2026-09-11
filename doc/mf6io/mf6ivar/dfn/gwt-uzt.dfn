@@ -285,7 +285,7 @@ description is a text keyword to indicate that air-water interfacial (AWI) sorpt
 
 block packagedata
 name packagedata
-type recarray ifno strt bulk_density distcoef sp2 por kaw d50 aux boundname
+type recarray ifno strt por bulk_density distcoef sp2 kaw d50 aux boundname
 shape (maxbound)
 reader urword
 longname
@@ -319,8 +319,9 @@ shape
 tagged false
 in_record true
 reader urword
+optional true
 longname solid-phase bulk density of the unsaturated zone material (Q617)
-description real value that defines the bulk density of the unsaturated-zone solid for this UZF cell.  Only used when SORPTION is active in the OPTIONS block; otherwise ignored (a placeholder value, e.g. 0.0, is still required on every PACKAGEDATA line).  MODFLOW 6 performs NO internal unit conversion on this value -- it is multiplied directly against DISTCOEF (see mst_fc_srb / this package's uzt_retardation), so the units of BULK_DENSITY and DISTCOEF must already be mutually consistent (e.g. kg/m3 with m3/kg, or kg/L with L/kg -- never mix the two systems).
+description real value that defines the bulk density of the unsaturated-zone solid for this UZF cell.  Only used when SORPTION is active in the OPTIONS block; otherwise ignored (a placeholder value, e.g. 0.0, is still required on every PACKAGEDATA line).  MODFLOW 6 performs NO internal unit conversion on this value -- it is multiplied directly against DISTCOEF (see mst_fc_srb / this package's uzt_retardation), so the units of BULK_DENSITY and DISTCOEF must already be mutually consistent (e.g. kg/m3 with m3/kg, or kg/L with L/kg -- never mix the two systems).  Present ONLY when SORPTION is specified in the OPTIONS block; omitted entirely otherwise, so existing UZT input files without SORPTION remain valid and are read byte-identically to previous MODFLOW 6 versions.
 
 block packagedata
 name distcoef
@@ -329,8 +330,9 @@ shape
 tagged false
 in_record true
 reader urword
+optional true
 longname Kd distribution coefficient (Q617)
-description real value that defines the solid-water distribution coefficient (Kd) for linear sorption in the unsaturated zone for this UZF cell.  Only used when SORPTION is active; otherwise ignored (placeholder required).  See BULK_DENSITY for the unit-consistency requirement -- this field is not independently converted.
+description real value that defines the solid-water distribution coefficient (Kd) for linear sorption in the unsaturated zone for this UZF cell.  Only used when SORPTION is active; otherwise ignored (placeholder required).  See BULK_DENSITY for the unit-consistency requirement -- this field is not independently converted.  Present ONLY when SORPTION is specified in the OPTIONS block.
 
 block packagedata
 name sp2
@@ -339,8 +341,9 @@ shape
 tagged false
 in_record true
 reader urword
+optional true
 longname second sorption isotherm parameter, reserved (Q617)
-description real value reserved for the second isotherm parameter (Freundlich exponent or Langmuir sorption maximum) once nonlinear SORPTION is implemented.  Currently unused by LINEAR sorption; a placeholder value is still required on every PACKAGEDATA line.
+description real value reserved for the second isotherm parameter (Freundlich exponent or Langmuir sorption maximum) once nonlinear SORPTION is implemented.  Currently unused by LINEAR sorption; a placeholder value is still required on every PACKAGEDATA line.  Present ONLY when SORPTION is specified in the OPTIONS block.
 
 block packagedata
 name por
@@ -349,8 +352,9 @@ shape
 tagged false
 in_record true
 reader urword
+optional true
 longname total porosity of the unsaturated zone material (Q617)
-description real value that defines the total porosity for this UZF cell.  Required (and must be > 0) whenever SORPTION or AWI_SORPTION is active -- it is the denominator in R's solid-phase term and is also used to derive water saturation Sw = theta/por for the AWI term.  Otherwise ignored (placeholder required).
+description real value that defines the total porosity for this UZF cell.  Required (and must be > 0) whenever SORPTION or AWI_SORPTION is active -- it is the denominator in R's solid-phase term and is also used to derive water saturation Sw = theta/por for the AWI term.  Otherwise ignored (placeholder required).  Present ONLY when SORPTION or AWI_SORPTION is specified in the OPTIONS block.
 
 block packagedata
 name kaw
@@ -359,8 +363,9 @@ shape
 tagged false
 in_record true
 reader urword
+optional true
 longname air-water interfacial partition coefficient (Q617)
-description real value that defines the air-water interfacial (AWI) partition coefficient for this UZF cell.  Only used when AWI_SORPTION is active; otherwise ignored (placeholder required).  Combines with the interfacial area term a_aw (see D50) to add (a_aw/theta)*KAW to the retardation factor -- the PFAS-specific mechanism absent from released MODFLOW 6 and MT3D-USGS.
+description real value that defines the air-water interfacial (AWI) partition coefficient for this UZF cell.  Only used when AWI_SORPTION is active; otherwise ignored (placeholder required).  Combines with the interfacial area term a_aw (see D50) to add (a_aw/theta)*KAW to the retardation factor -- the PFAS-specific mechanism absent from released MODFLOW 6 and MT3D-USGS.  Present ONLY when AWI_SORPTION is specified in the OPTIONS block.
 
 block packagedata
 name d50
@@ -369,8 +374,9 @@ shape
 tagged false
 in_record true
 reader urword
+optional true
 longname median grain diameter (Q617)
-description real value that defines the median grain diameter for this UZF cell, used to compute the air-water interfacial area per unit volume a_aw = 6*(1-por)*(1-sw)/d50.  Required (and must be > 0) whenever AWI_SORPTION is active; otherwise ignored (placeholder required).
+description real value that defines the median grain diameter for this UZF cell, used to compute the air-water interfacial area per unit volume a_aw = 6*(1-por)*(1-sw)/d50.  Required (and must be > 0) whenever AWI_SORPTION is active; otherwise ignored (placeholder required).  Present ONLY when AWI_SORPTION is specified in the OPTIONS block.
 
 block packagedata
 name aux
