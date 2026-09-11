@@ -27,8 +27,8 @@
 module GwtUztModule
 
   use KindModule, only: DP, I4B
-  use ConstantsModule, only: DZERO, DONE, LINELENGTH
-  use SimModule, only: store_error
+  use ConstantsModule, only: DZERO, DONE, DEP20, LINELENGTH, LENBOUNDNAME
+  use SimModule, only: store_error, count_errors
   use BndModule, only: BndType, GetBndFromList
   use TspFmiModule, only: TspFmiType
   use UzfModule, only: UzfType
@@ -36,6 +36,8 @@ module GwtUztModule
   use TspAptModule, only: TspAptType, apt_process_obsID, &
                           apt_process_obsID12
   use MatrixBaseModule
+  use IsothermEnumModule, only: SORPTION_OFF, SORPTION_LINEAR, &
+                                SORPTION_FREUND, SORPTION_LANG
   implicit none
 
   public uzt_create
@@ -52,6 +54,22 @@ module GwtUztModule
     integer(I4B), pointer :: idxbudritm => null() ! index of rej infil to mover rate to mover terms in flowbudptr
     real(DP), dimension(:), pointer, contiguous :: concinfl => null() ! infiltration concentration
     real(DP), dimension(:), pointer, contiguous :: concuzet => null() ! unsat et concentration
+    !
+    ! -- Q617: solid-phase + air-water interfacial (AWI) sorption in the unsaturated zone.
+    !    R = 1 + bulk_density*distcoef/theta + (a_aw/theta)*kaw,
+    !    a_aw = 6*(1-por)*(1-sw)/d50, sw = theta/por -- the same expression
+    !    publication/pfas-vadose-end-members/research/figures/decision_surface_uncertainty.py:63
+    !    uses analytically. Units are NOT converted anywhere in this code (verified against
+    !    gwt-mst.f90's isrb/bulk_density/distcoef, which multiplies them raw with no scaling
+    !    constant) -- pick ONE consistent system when supplying these and say so in the dfn.
+    integer(I4B), pointer :: isrb => null() ! sorption flag: 0 off, 1 linear, 2 freundlich, 3 langmuir
+    integer(I4B), pointer :: iawisrb => null() ! AWI sorption flag: 0 off, 1 on
+    real(DP), dimension(:), pointer, contiguous :: bulk_density => null() ! solid bulk density, per feature
+    real(DP), dimension(:), pointer, contiguous :: distcoef => null() ! Kd distribution coefficient, per feature
+    real(DP), dimension(:), pointer, contiguous :: sp2 => null() ! 2nd isotherm param (freundlich exponent / langmuir sorption max), per feature
+    real(DP), dimension(:), pointer, contiguous :: por => null() ! total porosity, per feature (needed for theta/por = Sw)
+    real(DP), dimension(:), pointer, contiguous :: kaw => null() ! air-water interfacial partition coefficient, per feature
+    real(DP), dimension(:), pointer, contiguous :: d50 => null() ! median grain diameter, per feature
 
   contains
 
@@ -73,6 +91,10 @@ module GwtUztModule
     procedure :: pak_bd_obs => uzt_bd_obs
     procedure :: pak_set_stressperiod => uzt_set_stressperiod
     procedure :: get_mvr_depvar
+    procedure :: bnd_options => uzt_options
+    procedure :: apt_read_cvs => uzt_read_cvs
+    procedure :: apt_stor_term => uzt_stor_term
+    procedure :: uzt_retardation
 
   end type GwtUztType
 
@@ -544,12 +566,16 @@ contains
     call mem_allocate(this%idxbudrinf, 'IDXBUDRINF', this%memoryPath)
     call mem_allocate(this%idxbuduzet, 'IDXBUDUZET', this%memoryPath)
     call mem_allocate(this%idxbudritm, 'IDXBUDRITM', this%memoryPath)
+    call mem_allocate(this%isrb, 'ISRB', this%memoryPath)
+    call mem_allocate(this%iawisrb, 'IAWISRB', this%memoryPath)
     !
     ! -- Initialize
     this%idxbudinfl = 0
     this%idxbudrinf = 0
     this%idxbuduzet = 0
     this%idxbudritm = 0
+    this%isrb = SORPTION_OFF
+    this%iawisrb = 0
   end subroutine allocate_scalars
 
   !> @brief Allocate arrays for package
@@ -594,14 +620,353 @@ contains
     call mem_deallocate(this%idxbudrinf)
     call mem_deallocate(this%idxbuduzet)
     call mem_deallocate(this%idxbudritm)
+    call mem_deallocate(this%isrb)
+    call mem_deallocate(this%iawisrb)
     !
     ! -- deallocate time series
     call mem_deallocate(this%concinfl)
     call mem_deallocate(this%concuzet)
     !
+    ! -- deallocate sorption arrays (allocated in uzt_read_cvs, sized this%ncv)
+    call mem_deallocate(this%bulk_density)
+    call mem_deallocate(this%distcoef)
+    call mem_deallocate(this%sp2)
+    call mem_deallocate(this%por)
+    call mem_deallocate(this%kaw)
+    call mem_deallocate(this%d50)
+    !
     ! -- deallocate scalars in TspAptType
     call this%TspAptType%bnd_da()
   end subroutine uzt_da
+
+  !> @brief Q617: UZT-specific options -- solid-phase SORPTION type and AWI_SORPTION toggle.
+  !!
+  !! Delegates anything it does not recognize to TspAptType%apt_options (the shared
+  !! advanced-package options: FLOW_PACKAGE_NAME, PRINT_CONCENTRATION, BUDGET, etc.).
+  !<
+  subroutine uzt_options(this, option, found)
+    ! -- dummy
+    class(GwtUztType), intent(inout) :: this
+    character(len=*), intent(inout) :: option
+    logical, intent(inout) :: found
+    ! -- local
+    character(len=LINELENGTH) :: keyword
+    character(len=LINELENGTH) :: errmsg
+    !
+    select case (option)
+    case ('SORPTION')
+      call this%parser%GetStringCaps(keyword)
+      select case (keyword)
+      case ('LINEAR')
+        this%isrb = SORPTION_LINEAR
+      case ('FREUNDLICH')
+        this%isrb = SORPTION_FREUND
+      case ('LANGMUIR')
+        this%isrb = SORPTION_LANG
+      case default
+        write (errmsg, '(a,1x,a)') &
+          'Unknown UZT SORPTION type, must be LINEAR, FREUNDLICH or &
+          &LANGMUIR:', trim(keyword)
+        call store_error(errmsg)
+      end select
+      write (this%iout, '(4x,a,1x,a)') &
+        'UZT SOLID-PHASE SORPTION IS ACTIVE, TYPE:', trim(keyword)
+      found = .true.
+    case ('AWI_SORPTION')
+      this%iawisrb = 1
+      write (this%iout, '(4x,a)') &
+        'UZT AIR-WATER INTERFACIAL (AWI) SORPTION IS ACTIVE.'
+      found = .true.
+    case default
+      ! -- delegate to the shared advanced-package options
+      call this%TspAptType%bnd_options(option, found)
+    end select
+  end subroutine uzt_options
+
+  !> @brief Q617: retardation factor for one UZT feature at the current water content.
+  !!
+  !! R = 1 + rhob*Kd/theta + (a_aw/theta)*Kaw, a_aw = 6*(1-por)*(1-Sw)/d50, Sw = theta/por.
+  !! Matches publication/pfas-vadose-end-members/research/figures/decision_surface_uncertainty.py:63
+  !! by construction. LINEAR sorption only -- FREUNDLICH/LANGMUIR are nonlinear (the isotherm
+  !! slope depends on concentration, so a single constant R cannot represent them the way
+  !! MST's per-node isotherm-derivative linearization does) and are refused with a loud error
+  !! rather than silently computing a wrong answer; that generalization is the next increment.
+  !! theta is v/Vcell using the CURRENT water volume, so this is naturally per-timestep --
+  !! that is MT3D-USGS eq. 24's "R updated for each transport time step" for free, not an
+  !! approximation of it (Lane P's sizing fact ii).
+  !<
+  function uzt_retardation(this, n, vcell, theta) result(r)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    real(DP), intent(in) :: vcell !< feature cell/reference volume
+    real(DP), intent(in) :: theta !< current water content (v/vcell)
+    ! -- local
+    real(DP) :: r
+    real(DP) :: a_aw, sw
+    character(len=LINELENGTH) :: errmsg
+    !
+    r = DONE
+    if (this%isrb == SORPTION_OFF .and. this%iawisrb == 0) return
+    !
+    select case (this%isrb)
+    case (SORPTION_OFF)
+      ! -- no solid-phase term
+    case (SORPTION_LINEAR)
+      if (theta > DZERO) then
+        r = r + this%bulk_density(n) * this%distcoef(n) / theta
+      end if
+    case default
+      write (errmsg, '(a)') &
+        'UZT SORPTION FREUNDLICH/LANGMUIR is not yet implemented (Q617 solid- &
+        &phase-linear + AWI increment only) -- use SORPTION LINEAR or contact &
+        &the engine seat before shipping a nonlinear UZT run.'
+      call store_error(errmsg)
+      call this%parser%StoreErrorUnit()
+    end select
+    !
+    if (this%iawisrb == 1) then
+      if (theta > DZERO .and. this%por(n) > DZERO .and. this%d50(n) > DZERO) then
+        sw = theta / this%por(n)
+        a_aw = 6.0_DP * (DONE - this%por(n)) * (DONE - sw) / this%d50(n)
+        r = r + (a_aw / theta) * this%kaw(n)
+      end if
+    end if
+  end function uzt_retardation
+
+  !> @brief Q617: UZT storage term, overriding TspAptType%apt_stor_term to scale the stored
+  !! water volume by the retardation factor -- MT3D-USGS eq. 25
+  !! (Vcell*R^n*theta_w^n*dC/dt). v1 is the CURRENT water volume from apt_get_volumes, so
+  !! theta = v1/vcell (and v0/vcell for the prior step) is already per-timestep; scaling v0
+  !! and v1 independently by their own timestep's R is what makes eq. 24's time-varying R
+  !! fall out of the existing structure (Lane P's sizing fact ii, verified against
+  !! tsp-apt.f90:2256 before this was written). With isrb=OFF and iawisrb=0,
+  !! uzt_retardation returns 1.0 and this is byte-identical to the inherited apt_stor_term --
+  !! that identity IS acceptance test (b)'s control.
+  !!
+  !! MASS BALANCE (work item 3): this function's rrate becomes this%qsto(n), the package's
+  !! STORAGE budget term (tsp-apt.f90:942-947) -- so scaling v0/v1 here makes STORAGE report
+  !! water+sorbed mass together automatically. No separate sorbed-mass budget term is needed;
+  !! confirmed by reading how qsto is filled before writing this, not assumed.
+  !<
+  subroutine uzt_stor_term(this, ientry, n1, n2, rrate, rhsval, hcofval)
+    use TdisModule, only: delt
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: ientry
+    integer(I4B), intent(inout) :: n1
+    integer(I4B), intent(inout) :: n2
+    real(DP), intent(inout), optional :: rrate
+    real(DP), intent(inout), optional :: rhsval
+    real(DP), intent(inout), optional :: hcofval
+    ! -- local
+    real(DP) :: v0, v1
+    real(DP) :: c0, c1
+    real(DP) :: vcell, r0, r1
+    !
+    n1 = ientry
+    n2 = ientry
+    call this%apt_get_volumes(n1, v1, v0, delt)
+    c0 = this%xoldpak(n1)
+    c1 = this%xnewpak(n1)
+    !
+    if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
+      vcell = max(v0, v1) ! reference volume for theta; v0/v1 already ARE feature water volumes
+      if (vcell > DZERO) then
+        r0 = this%uzt_retardation(n1, vcell, v0 / vcell)
+        r1 = this%uzt_retardation(n1, vcell, v1 / vcell)
+      else
+        r0 = DONE
+        r1 = DONE
+      end if
+      v0 = r0 * v0
+      v1 = r1 * v1
+    end if
+    !
+    if (present(rrate)) then
+      rrate = (-c1 * v1 / delt + c0 * v0 / delt) * this%eqnsclfac
+    end if
+    if (present(rhsval)) rhsval = -c0 * v0 * this%eqnsclfac / delt
+    if (present(hcofval)) hcofval = -v1 * this%eqnsclfac / delt
+  end subroutine uzt_stor_term
+
+  !> @brief Q617: UZT PACKAGEDATA reader, extended with per-feature sorption parameters.
+  !!
+  !! Copy of TspAptType%apt_read_cvs (tsp-apt.f90:1470) with six new columns inserted
+  !! between STRT and AUX -- BULK_DENSITY, DISTCOEF, SP2, POR, KAW, D50 -- matching the
+  !! precedent already in this codebase: gwe-lke.f90's lke_read_cvs inserts its own
+  !! package-specific KTF/RFEATTHK in exactly this position, unconditionally present on
+  !! every line regardless of any options flag (the values are simply unused if SORPTION
+  !! and AWI_SORPTION are both off, same as LKE's thermal terms when conduction is unused).
+  !<
+  subroutine uzt_read_cvs(this)
+    ! -- modules
+    use MemoryManagerModule, only: mem_allocate
+    use TimeSeriesManagerModule, only: read_value_or_time_series_adv
+    ! -- dummy
+    class(GwtUztType), intent(inout) :: this
+    ! -- local
+    character(len=LINELENGTH) :: text
+    character(len=LINELENGTH) :: errmsg
+    character(len=LENBOUNDNAME) :: bndName, bndNameTemp
+    character(len=9) :: cno
+    character(len=50), dimension(:), allocatable :: caux
+    integer(I4B) :: ierr
+    logical :: isfound, endOfBlock
+    integer(I4B) :: n
+    integer(I4B) :: ii, jj
+    integer(I4B) :: iaux
+    integer(I4B) :: itmp
+    integer(I4B) :: nlak
+    integer(I4B) :: nconn
+    integer(I4B), dimension(:), pointer, contiguous :: nboundchk
+    real(DP), pointer :: bndElem => null()
+    !
+    itmp = 0
+    !
+    call mem_allocate(this%strt, this%ncv, 'STRT', this%memoryPath)
+    call mem_allocate(this%lauxvar, this%naux, this%ncv, 'LAUXVAR', &
+                      this%memoryPath)
+    call mem_allocate(this%bulk_density, this%ncv, 'BULK_DENSITY', this%memoryPath)
+    call mem_allocate(this%distcoef, this%ncv, 'DISTCOEF', this%memoryPath)
+    call mem_allocate(this%sp2, this%ncv, 'SP2', this%memoryPath)
+    call mem_allocate(this%por, this%ncv, 'POR', this%memoryPath)
+    call mem_allocate(this%kaw, this%ncv, 'KAW', this%memoryPath)
+    call mem_allocate(this%d50, this%ncv, 'D50', this%memoryPath)
+    !
+    if (this%imatrows == 0) then
+      call mem_allocate(this%iboundpak, this%ncv, 'IBOUND', this%memoryPath)
+      call mem_allocate(this%xnewpak, this%ncv, 'XNEWPAK', this%memoryPath)
+    end if
+    call mem_allocate(this%xoldpak, this%ncv, 'XOLDPAK', this%memoryPath)
+    !
+    allocate (this%featname(this%ncv))
+    !
+    do n = 1, this%ncv
+      this%strt(n) = DEP20
+      this%lauxvar(:, n) = DZERO
+      this%xoldpak(n) = DEP20
+      this%bulk_density(n) = DZERO
+      this%distcoef(n) = DZERO
+      this%sp2(n) = DZERO
+      this%por(n) = DZERO
+      this%kaw(n) = DZERO
+      this%d50(n) = DZERO
+      if (this%imatrows == 0) then
+        this%iboundpak(n) = 1
+        this%xnewpak(n) = DEP20
+      end if
+    end do
+    !
+    if (this%naux > 0) then
+      allocate (caux(this%naux))
+    end if
+    !
+    allocate (nboundchk(this%ncv))
+    do n = 1, this%ncv
+      nboundchk(n) = 0
+    end do
+    !
+    call this%parser%GetBlock('PACKAGEDATA', isfound, ierr, &
+                              supportOpenClose=.true.)
+    !
+    if (isfound) then
+      write (this%iout, '(/1x,a)') 'PROCESSING '//trim(adjustl(this%text))// &
+        ' PACKAGEDATA'
+      nlak = 0
+      nconn = 0
+      do
+        call this%parser%GetNextLine(endOfBlock)
+        if (endOfBlock) exit
+        n = this%parser%GetInteger()
+
+        if (n < 1 .or. n > this%ncv) then
+          write (errmsg, '(a,1x,i6)') &
+            'Itemno must be > 0 and <= ', this%ncv
+          call store_error(errmsg)
+          cycle
+        end if
+        !
+        nboundchk(n) = nboundchk(n) + 1
+        !
+        ! -- strt
+        this%strt(n) = this%parser%GetDouble()
+        !
+        ! -- Q617: sorption parameters, always present (unused unless SORPTION /
+        !    AWI_SORPTION active -- same convention gwe-lke.f90 uses for KTF/RFEATTHK)
+        this%bulk_density(n) = this%parser%GetDouble()
+        this%distcoef(n) = this%parser%GetDouble()
+        this%sp2(n) = this%parser%GetDouble()
+        this%por(n) = this%parser%GetDouble()
+        this%kaw(n) = this%parser%GetDouble()
+        this%d50(n) = this%parser%GetDouble()
+        if (this%isrb /= SORPTION_OFF .and. this%por(n) <= DZERO) then
+          write (errmsg, '(a,1x,i0)') &
+            'POR must be > 0 when SORPTION is active, feature', n
+          call store_error(errmsg)
+        end if
+        if (this%iawisrb == 1 .and. (this%por(n) <= DZERO .or. this%d50(n) <= DZERO)) then
+          write (errmsg, '(a,1x,i0)') &
+            'POR and D50 must both be > 0 when AWI_SORPTION is active, feature', n
+          call store_error(errmsg)
+        end if
+        !
+        ! -- get aux data
+        do iaux = 1, this%naux
+          call this%parser%GetString(caux(iaux))
+        end do
+
+        write (cno, '(i9.9)') n
+        bndName = 'Feature'//cno
+
+        if (this%inamedbound /= 0) then
+          call this%parser%GetStringCaps(bndNameTemp)
+          if (bndNameTemp /= '') then
+            bndName = bndNameTemp
+          end if
+        end if
+        this%featname(n) = bndName
+
+        do jj = 1, this%naux
+          text = caux(jj)
+          ii = n
+          bndElem => this%lauxvar(jj, ii)
+          call read_value_or_time_series_adv(text, ii, jj, bndElem, &
+                                             this%packName, 'AUX', &
+                                             this%tsManager, this%iprpak, &
+                                             this%auxname(jj))
+        end do
+        !
+        nlak = nlak + 1
+      end do
+      !
+      do n = 1, this%ncv
+        if (nboundchk(n) == 0) then
+          write (errmsg, '(a,1x,i0)') 'No data specified for feature', n
+          call store_error(errmsg)
+        else if (nboundchk(n) > 1) then
+          write (errmsg, '(a,1x,i0,1x,a,1x,i0,1x,a)') &
+            'Data for feature', n, 'specified', nboundchk(n), 'times'
+          call store_error(errmsg)
+        end if
+      end do
+      !
+      write (this%iout, '(1x,a)') &
+        'END OF '//trim(adjustl(this%text))//' PACKAGEDATA'
+    else
+      call store_error('Required packagedata block not found.')
+    end if
+    !
+    if (count_errors() > 0) then
+      call this%parser%StoreErrorUnit()
+    end if
+    !
+    if (this%naux > 0) then
+      deallocate (caux)
+    end if
+    !
+    deallocate (nboundchk)
+  end subroutine uzt_read_cvs
 
   !> @brief Infiltration term
   !!
