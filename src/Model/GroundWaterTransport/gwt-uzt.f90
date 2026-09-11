@@ -104,6 +104,7 @@ module GwtUztModule
     procedure :: bnd_options => uzt_options
     procedure :: apt_read_cvs => uzt_read_cvs
     procedure :: apt_stor_term => uzt_stor_term
+    procedure :: uzt_sorbed_vol
     procedure :: uzt_retardation
     procedure :: uzt_cellvol
 
@@ -768,28 +769,28 @@ contains
   !! fact ii). vcell is carried for that sizing note and for future area-based terms; it is
   !! not read here.
   !<
-  function uzt_retardation(this, n, vcell, theta_m, theta_t) result(r)
+  function uzt_sorbed_vol(this, n, vcell, theta_t) result(vsorb)
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: n
-    real(DP), intent(in) :: vcell !< feature cell/reference volume
-    real(DP), intent(in) :: theta_m !< MOBILE water content (v/vcell) -- partitioning denominator
-    real(DP), intent(in) :: theta_t !< TOTAL water content (theta_m + thtr) -- saturation only
+    real(DP), intent(in) :: vcell !< GWF cell volume (area*(top-bot))
+    real(DP), intent(in) :: theta_t !< TOTAL water content -- SATURATION ONLY, for A_aw
     ! -- local
-    real(DP) :: r
+    real(DP) :: vsorb
     real(DP) :: a_aw, sw
     character(len=LINELENGTH) :: errmsg
     !
-    r = DONE
+    vsorb = DZERO
     if (this%isrb == SORPTION_OFF .and. this%iawisrb == 0) return
+    if (vcell <= DZERO) return
     !
     select case (this%isrb)
     case (SORPTION_OFF)
       ! -- no solid-phase term
     case (SORPTION_LINEAR)
-      if (theta_m > DZERO) then
-        r = r + this%bulk_density(n) * this%distcoef(n) / theta_m
-      end if
+      ! rho_b*Kd*c is mass per BULK volume. No water content appears, and none is
+      ! introduced -- this is the whole content of the Finding 36 repair.
+      vsorb = vsorb + this%bulk_density(n) * this%distcoef(n) * vcell
     case default
       write (errmsg, '(a)') &
         'UZT SORPTION FREUNDLICH/LANGMUIR is not yet implemented (Q617 solid- &
@@ -800,39 +801,84 @@ contains
     end select
     !
     if (this%iawisrb == 1) then
-      if (theta_m > DZERO .and. this%por(n) > DZERO .and. this%d50(n) > DZERO) then
-        ! Sw is PHYSICAL wetness and takes theta_t; the 1/theta_m that follows is the
-        ! partitioning denominator and cancels against the mobile volume. See the docstring.
+      if (this%por(n) > DZERO .and. this%d50(n) > DZERO) then
+        ! S_w is PHYSICAL wetness, so it takes TOTAL theta: residual water wets grains
+        ! whether or not it drains, and an air-water interface does not care whether the
+        ! water on the far side of it is mobile. This half of 8fadf65 was RIGHT and is kept.
         sw = theta_t / this%por(n)
         a_aw = 6.0_DP * (DONE - this%por(n)) * (DONE - sw) / this%d50(n)
-        r = r + (a_aw / theta_m) * this%kaw(n)
+        vsorb = vsorb + a_aw * this%kaw(n) * vcell
       end if
+    end if
+  end function uzt_sorbed_vol
+
+  !> @brief Q617: retardation factor, DERIVED from the theta-free sorbed volume. DIAGNOSTIC.
+  !!
+  !! R = 1 + V_sorb/V_water, which is identically 1 + rhob*Kd/theta + (A_aw/theta)*Kaw for
+  !! whichever theta the caller's water volume expresses. Reported, never multiplied: the
+  !! storage term uses uzt_sorbed_vol directly. Returns 1 when there is no water to
+  !! partition against, since R is undefined there and the MASS is not -- which is exactly
+  !! why R is no longer the primitive.
+  !<
+  function uzt_retardation(this, n, vcell, vwater, theta_t) result(r)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    real(DP), intent(in) :: vcell !< GWF cell volume
+    real(DP), intent(in) :: vwater !< water volume R is expressed against
+    real(DP), intent(in) :: theta_t !< TOTAL water content, for A_aw
+    ! -- local
+    real(DP) :: r
+    !
+    r = DONE
+    if (vwater > DZERO) then
+      r = r + this%uzt_sorbed_vol(n, vcell, theta_t) / vwater
     end if
   end function uzt_retardation
 
-  !> @brief Q617: UZT storage term, overriding TspAptType%apt_stor_term to scale the stored
-  !! MOBILE water volume by the retardation factor. v1 is the CURRENT mobile water volume
-  !! from apt_get_volumes, so theta_m = v1/vcell (and v0/vcell for the prior step) is already
-  !! per-timestep; scaling v0 and v1 independently by their own timestep's R is what makes
-  !! eq. 24's time-varying R fall out of the existing structure (Lane P's sizing fact ii,
-  !! verified against tsp-apt.f90:2256 before this was written). With isrb=OFF and
-  !! iawisrb=0, uzt_retardation returns 1.0 and this is byte-identical to the inherited
-  !! apt_stor_term -- that identity IS acceptance test (b)'s control, and preserving it is
-  !! why the Finding 36 repair keeps the MOBILE volume here instead of moving to a total one.
+  !> @brief Q617: UZT storage term, overriding TspAptType%apt_stor_term to ADD the sorbed
+  !! volume-equivalent to the stored water volume. THETA-FREE BY CONSTRUCTION:
   !!
-  !! WHAT R*v_m EXPANDS TO, which is the property to check rather than R itself:
-  !!   (1 + rhob*Kd/theta_m) * theta_m*Vcell  =  theta_m*Vcell  +  rhob*Kd*Vcell
-  !! aqueous on mobile water (stock MF6 UZT's transport, unchanged by this patch) plus a
-  !! solid-phase term with NO water content in it. A within-code ratio cannot see whether
-  !! that second term is right -- it is R by construction -- so the acceptance row for this
-  !! is a MASS row: sorbed = rhob*Kd, 1.6500 repaired against 0.9619 under 8fadf65, and the
-  !! defect's signature is that it worsens on drying (0.1500 at theta_m 0.0050).
+  !!   v_eff = v_water + (rhob*Kd + A_aw*Kaw) * Vcell
+  !!
+  !! aqueous on the MOBILE water apt_get_volumes hands us (stock MF6 UZT's transport model,
+  !! unchanged by this patch) plus sorbed terms that contain NO water content at all.
+  !!
+  !! WHY NOT R. The earlier form multiplied v by a retardation factor, and that is how
+  !! Finding 36 happened: FORMING R REQUIRES CHOOSING A THETA FOR THE DENOMINATOR, AND
+  !! MULTIPLYING R BY A VOLUME REQUIRES THE SAME THETA. 8fadf65 changed the first choice and
+  !! not the second, so the cancellation went partial and the sorbed term came out
+  !! rhob*Kd*Vcell*(theta_m/theta_t) -- 42% low here, and -> 0 as the profile dries, a drier
+  !! soil sorbing less. Written theta-free the mass is correct under EVERY water convention
+  !! and the question that caused the defect cannot be asked. (Lane Z, Amendment 2; it
+  !! supersedes the R-on-mobile-theta repair this seat implemented first, which was
+  !! numerically equal and structurally worse.)
+  !!
+  !! AND IT REMOVES A DIVISION NOBODY HAD FLAGGED: R = 1 + rhob*Kd/theta diverges as a cell
+  !! dries and v_water = 0 divides by zero exactly. The R form's theta > 0 guard does not
+  !! rescue it -- it yields v_eff = 0, i.e. a singular row carrying NO sorbed storage, when
+  !! the right answer at zero mobile water is still rhob*Kd*Vcell. The theta-free form has
+  !! no division and is well-posed at theta_m = 0.
+  !!
+  !! Each step gets its own v_sorb, so eq. 24's time-varying R still falls out of the
+  !! existing structure through A_aw's saturation dependence (Lane P's sizing fact ii,
+  !! verified against tsp-apt.f90:2256). With isrb=OFF and iawisrb=0 the block is skipped
+  !! entirely, v is untouched, and this is byte-identical to the inherited apt_stor_term --
+  !! that identity IS acceptance test (b)'s control.
+  !!
+  !! ACCEPTANCE IS A MASS, NOT A RATIO, and that is the night's lesson rather than a
+  !! preference: THREE ratio instruments were blind to this defect -- section 4 row 3 (14.75
+  !! on both builds), the 8/8 acceptance matrix, and the sorbed/aqueous budget ratio
+  !! (13.7615 defective against MT3D's 13.7615, identical to 1.78e-15) -- because the defect
+  !! enters as a COMMON FACTOR and every ratio divides it out. The sorbed term itself sees
+  !! it: 1.6500 correct against 0.9619 at theta_m 0.0699, 0.1500 at 0.0050, 0.0163 at
+  !! 0.0005. Two points minimum; the fall toward zero on drying is the signature.
   !!
   !! This docstring previously read "theta = v1/vcell" while the body computed v/vcell+thtr.
-  !! The docstring was right and the code was wrong; they are back in agreement.
+  !! The docstring was right and the code was wrong; neither quantity is used that way now.
   !!
   !! MASS BALANCE (work item 3): this function's rrate becomes this%qsto(n), the package's
-  !! STORAGE budget term (tsp-apt.f90:942-947) -- so scaling v0/v1 here makes STORAGE report
+  !! STORAGE budget term (tsp-apt.f90:942-947) -- so adding v_sorb here makes STORAGE report
   !! water+sorbed mass together automatically. No separate sorbed-mass budget term is needed;
   !! confirmed by reading how qsto is filled before writing this, not assumed.
   !<
@@ -849,7 +895,7 @@ contains
     ! -- local
     real(DP) :: v0, v1
     real(DP) :: c0, c1
-    real(DP) :: vcell, r0, r1
+    real(DP) :: vcell
     !
     n1 = ientry
     n2 = ientry
@@ -867,18 +913,12 @@ contains
       vcell = this%uzt_cellvol(n1)
       if (vcell > DZERO) then
         ! v0/v1 are MOBILE water volumes (gwf-uzf.f90:3014 subtracts thtr and says so in its
-        ! own comment), and R is multiplied back by those SAME mobile volumes below. So the
-        ! partitioning denominator MUST be mobile theta for rhob*Kd*Vcell to survive intact;
-        ! thtr is passed separately as the saturation input, NOT folded into the denominator.
-        ! That folding was 8fadf65 and it is Finding 36.
-        r0 = this%uzt_retardation(n1, vcell, v0 / vcell, v0 / vcell + this%thtr(n1))
-        r1 = this%uzt_retardation(n1, vcell, v1 / vcell, v1 / vcell + this%thtr(n1))
-      else
-        r0 = DONE
-        r1 = DONE
+        ! own comment). They are left ALONE: the sorbed volume-equivalent is ADDED to them,
+        ! never multiplied into them. thtr enters only through theta_t, and only as the
+        ! SATURATION argument that A_aw needs -- it is absent from the solid-phase mass.
+        v0 = v0 + this%uzt_sorbed_vol(n1, vcell, v0 / vcell + this%thtr(n1))
+        v1 = v1 + this%uzt_sorbed_vol(n1, vcell, v1 / vcell + this%thtr(n1))
       end if
-      v0 = r0 * v0
-      v1 = r1 * v1
     end if
     !
     if (present(rrate)) then
