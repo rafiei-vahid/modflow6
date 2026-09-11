@@ -892,14 +892,27 @@ contains
         ! -- strt
         this%strt(n) = this%parser%GetDouble()
         !
-        ! -- Q617: sorption parameters, always present (unused unless SORPTION /
-        !    AWI_SORPTION active -- same convention gwe-lke.f90 uses for KTF/RFEATTHK)
-        this%bulk_density(n) = this%parser%GetDouble()
-        this%distcoef(n) = this%parser%GetDouble()
-        this%sp2(n) = this%parser%GetDouble()
-        this%por(n) = this%parser%GetDouble()
-        this%kaw(n) = this%parser%GetDouble()
-        this%d50(n) = this%parser%GetDouble()
+        ! -- Q617: sorption parameters, read ONLY when the matching option is active.
+        !    gwe-lke.f90 reads its KTF/RFEATTHK unconditionally, but LKE could afford that
+        !    -- UZT cannot. UZT is a RELEASED package with existing input files, including
+        !    the eight site models behind our own CONHYD submission (the build scripts
+        !    under publication/pfas-vadose-end-members/research/site_models). Mandatory new
+        !    columns would make every one of them unreadable by this binary, i.e. would
+        !    break the reproducibility artifacts of the very paper this feature answers.
+        !    Conditional reading also makes "no SORPTION keyword" byte-identical to the
+        !    unpatched binary, which is the control acceptance tests (b) and (e) rest on.
+        if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
+          this%por(n) = this%parser%GetDouble()
+        end if
+        if (this%isrb /= SORPTION_OFF) then
+          this%bulk_density(n) = this%parser%GetDouble()
+          this%distcoef(n) = this%parser%GetDouble()
+          this%sp2(n) = this%parser%GetDouble()
+        end if
+        if (this%iawisrb == 1) then
+          this%kaw(n) = this%parser%GetDouble()
+          this%d50(n) = this%parser%GetDouble()
+        end if
         if (this%isrb /= SORPTION_OFF .and. this%por(n) <= DZERO) then
           write (errmsg, '(a,1x,i0)') &
             'POR must be > 0 when SORPTION is active, feature', n
