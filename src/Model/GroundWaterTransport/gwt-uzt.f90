@@ -80,6 +80,10 @@ module GwtUztModule
     ! GWF cell volume per UZT feature, so theta = water_volume / cell_volume. Filled once from
     ! the GWF budget term (id1 = feature, id2 = gwf node) the first time it is needed.
     real(DP), dimension(:), pointer, contiguous :: cellvol => null()
+    ! Q678 (patch 0006): GWF node per UZT feature, filled by the same walk as cellvol, so the
+    ! GWF saturation of that node (fmi%gwfsat) can bound the sorbing solid to the UNSATURATED
+    ! part of the cell. MST sorbs vcell*gwfsat (gwt-mst.f90:355-377); UZT sorbs the complement.
+    integer(I4B), dimension(:), pointer, contiguous :: cellnode => null()
 
   contains
 
@@ -648,6 +652,7 @@ contains
     call mem_deallocate(this%d50)
     call mem_deallocate(this%thtr)
     call mem_deallocate(this%cellvol)
+    call mem_deallocate(this%cellnode)
     !
     ! -- deallocate scalars in TspAptType
     call this%TspAptType%bnd_da()
@@ -726,6 +731,7 @@ contains
       if (node < 1) cycle
       this%cellvol(ifeat) = this%dis%area(node) * &
                             (this%dis%top(node) - this%dis%bot(node))
+      this%cellnode(ifeat) = node
     end do
     vcell = this%cellvol(n)
   end function uzt_cellvol
@@ -773,8 +779,9 @@ contains
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: n
-    real(DP), intent(in) :: vcell !< GWF cell volume (area*(top-bot))
-    real(DP), intent(in) :: theta_t !< TOTAL water content -- SATURATION ONLY, for A_aw
+    real(DP), intent(in) :: vcell !< SORBING solid volume: the UNSATURATED part of the GWF cell,
+                                  !! vcell*(1 - sat) (Q678, patch 0006); the saturated part is MST's
+    real(DP), intent(in) :: theta_t !< TOTAL water content of that unsaturated volume -- SATURATION ONLY, for A_aw
     ! -- local
     real(DP) :: vsorb
     real(DP) :: a_aw, sw
@@ -824,7 +831,7 @@ contains
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: n
-    real(DP), intent(in) :: vcell !< GWF cell volume
+    real(DP), intent(in) :: vcell !< SORBING (unsaturated) solid volume, as uzt_sorbed_vol takes it
     real(DP), intent(in) :: vwater !< water volume R is expressed against
     real(DP), intent(in) :: theta_t !< TOTAL water content, for A_aw
     ! -- local
@@ -896,6 +903,8 @@ contains
     real(DP) :: v0, v1
     real(DP) :: c0, c1
     real(DP) :: vcell
+    real(DP) :: vu0, vu1
+    integer(I4B) :: node
     !
     n1 = ientry
     n2 = ientry
@@ -916,8 +925,27 @@ contains
         ! own comment). They are left ALONE: the sorbed volume-equivalent is ADDED to them,
         ! never multiplied into them. thtr enters only through theta_t, and only as the
         ! SATURATION argument that A_aw needs -- it is absent from the solid-phase mass.
-        v0 = v0 + this%uzt_sorbed_vol(n1, vcell, v0 / vcell + this%thtr(n1))
-        v1 = v1 + this%uzt_sorbed_vol(n1, vcell, v1 / vcell + this%thtr(n1))
+        ! Q678 (patch 0006): sorb over the UNSATURATED solid only. vcell*(1 - sat) is the exact
+        ! complement of MST's vcell*sat (gwt-mst.f90:355-377), with the same new/old pair MST uses
+        ! (gwfsat for v1, gwfsatold for v0), so each grain is counted once. gwfsatold is not
+        ! clipped by stock (tsp-fmi.f90:503-523), so both are clipped to [0,1] here. sat = 0 gives
+        ! vu = vcell*1.0 = vcell bit-exactly (c815ce2's value); sat = 1 gives vu = 0 and stock UZT
+        ! storage. theta_t is the wetness of that UNSATURATED volume (v/vu + thtr): c815ce2 divided
+        ! by the full vcell, which understated Sw and overstated A_aw wherever the water table sat
+        ! inside the cell.
+        node = this%cellnode(n1)
+        vu0 = vcell
+        vu1 = vcell
+        if (node > 0) then
+          vu0 = vcell * (DONE - min(DONE, max(DZERO, this%fmi%gwfsatold(node, delt))))
+          vu1 = vcell * (DONE - min(DONE, max(DZERO, this%fmi%gwfsat(node))))
+        end if
+        if (vu0 > DZERO) then
+          v0 = v0 + this%uzt_sorbed_vol(n1, vu0, v0 / vu0 + this%thtr(n1))
+        end if
+        if (vu1 > DZERO) then
+          v1 = v1 + this%uzt_sorbed_vol(n1, vu1, v1 / vu1 + this%thtr(n1))
+        end if
       end if
     end if
     !
@@ -973,6 +1001,7 @@ contains
     call mem_allocate(this%d50, this%ncv, 'D50', this%memoryPath)
     call mem_allocate(this%thtr, this%ncv, 'THTR', this%memoryPath)
     call mem_allocate(this%cellvol, this%ncv, 'CELLVOL', this%memoryPath)
+    call mem_allocate(this%cellnode, this%ncv, 'CELLNODE', this%memoryPath)
     !
     if (this%imatrows == 0) then
       call mem_allocate(this%iboundpak, this%ncv, 'IBOUND', this%memoryPath)
@@ -994,6 +1023,7 @@ contains
       this%d50(n) = DZERO
       this%thtr(n) = DZERO
       this%cellvol(n) = DZERO
+      this%cellnode(n) = 0
       if (this%imatrows == 0) then
         this%iboundpak(n) = 1
         this%xnewpak(n) = DEP20
