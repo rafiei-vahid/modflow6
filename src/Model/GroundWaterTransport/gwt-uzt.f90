@@ -109,6 +109,7 @@ module GwtUztModule
     procedure :: apt_read_cvs => uzt_read_cvs
     procedure :: apt_stor_term => uzt_stor_term
     procedure :: uzt_sorbed_vol
+    procedure :: uzt_capacity
     procedure :: uzt_retardation
     procedure :: uzt_cellvol
 
@@ -819,6 +820,61 @@ contains
     end if
   end function uzt_sorbed_vol
 
+  !> @brief Q685 (patch 0007): a feature's TOTAL storage capacity at one time level.
+  !!
+  !! vwat + the sorbed volume-equivalent over the unsaturated solid, computed EXACTLY as
+  !! uzt_stor_term computes it -- this function is the single source both use, so the storage
+  !! term and the rejected-infiltration branch cannot drift apart. `satval` is the GWF cell
+  !! saturation AT THAT LEVEL (gwfsat for the new level, gwfsatold for the old); a feature with
+  !! no GWF cell passes DZERO, which reproduces the vu = vcell case.
+  !!
+  !! It returns 0 exactly when the feature has neither mobile water nor sorbent -- the condition
+  !! patch 0007 branches on.
+  !<
+  function uzt_capacity(this, n, vwat, satval) result(vtot)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    real(DP), intent(in) :: vwat
+    real(DP), intent(in) :: satval
+    ! -- return
+    real(DP) :: vtot
+    ! -- local
+    real(DP) :: vcell
+    real(DP) :: vu
+    !
+    ! The commentary below travelled here from uzt_stor_term when patch 0007 made this the single
+    ! source; it is the record of two defects already paid for and must not be lost to a refactor.
+    !
+    ! theta = WATER volume / CELL volume. vwat is a water volume, so the denominator must be the
+    ! GWF cell volume. An earlier version used max(v0,v1) here, which made theta identically ~1.0:
+    ! the AWI area term then saw Sw = theta/por = 2.5 > 1, flipped sign, and SPED transport up.
+    ! Measured 2.5720 and 1.5110 against the 2.600 and 1.520 that theta=1 predicts -- the
+    ! acceptance matrix caught it and the pre-registered numbers identified it.
+    vtot = vwat
+    if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
+      ! vwat is a MOBILE water volume (gwf-uzf.f90:3014 subtracts thtr and says so in its own
+      ! comment). It is left ALONE: the sorbed volume-equivalent is ADDED to it, never multiplied
+      ! into it. thtr enters only through theta_t, and only as the SATURATION argument that A_aw
+      ! needs -- it is absent from the solid-phase mass.
+      ! Q678 (patch 0006): sorb over the UNSATURATED solid only. vcell*(1 - sat) is the exact
+      ! complement of MST's vcell*sat (gwt-mst.f90:355-377), with the same new/old pair MST uses
+      ! (gwfsat for the new level, gwfsatold for the old), so each grain is counted once.
+      ! gwfsatold is not clipped by stock (tsp-fmi.f90:503-523), so satval is clipped to [0,1]
+      ! here. sat = 0 gives vu = vcell*1.0 = vcell bit-exactly (c815ce2's value); sat = 1 gives
+      ! vu = 0 and stock UZT storage. theta_t is the wetness of that UNSATURATED volume
+      ! (vwat/vu + thtr): c815ce2 divided by the full vcell, which understated Sw and overstated
+      ! A_aw wherever the water table sat inside the cell.
+      vcell = this%uzt_cellvol(n)
+      if (vcell > DZERO) then
+        vu = vcell * (DONE - min(DONE, max(DZERO, satval)))
+        if (vu > DZERO) then
+          vtot = vtot + this%uzt_sorbed_vol(n, vu, vwat / vu + this%thtr(n))
+        end if
+      end if
+    end if
+  end function uzt_capacity
+
   !> @brief Q617: retardation factor, DERIVED from the theta-free sorbed volume. DIAGNOSTIC.
   !!
   !! R = 1 + V_sorb/V_water, which is identically 1 + rhob*Kd/theta + (A_aw/theta)*Kaw for
@@ -902,8 +958,7 @@ contains
     ! -- local
     real(DP) :: v0, v1
     real(DP) :: c0, c1
-    real(DP) :: vcell
-    real(DP) :: vu0, vu1
+    real(DP) :: sat0, sat1
     integer(I4B) :: node
     !
     n1 = ientry
@@ -912,42 +967,21 @@ contains
     c0 = this%xoldpak(n1)
     c1 = this%xnewpak(n1)
     !
-    if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
-      ! theta = WATER volume / CELL volume. v0/v1 from apt_get_volumes are the water volumes,
-      ! so the denominator must be the GWF cell volume. An earlier version used
-      ! max(v0,v1) here, which made theta identically ~1.0: the AWI area term then saw
-      ! Sw = theta/por = 2.5 > 1, flipped sign, and SPED transport up. Measured 2.5720 and
-      ! 1.5110 against the 2.600 and 1.520 that theta=1 predicts -- the acceptance matrix
-      ! caught it and the pre-registered numbers identified it.
-      vcell = this%uzt_cellvol(n1)
-      if (vcell > DZERO) then
-        ! v0/v1 are MOBILE water volumes (gwf-uzf.f90:3014 subtracts thtr and says so in its
-        ! own comment). They are left ALONE: the sorbed volume-equivalent is ADDED to them,
-        ! never multiplied into them. thtr enters only through theta_t, and only as the
-        ! SATURATION argument that A_aw needs -- it is absent from the solid-phase mass.
-        ! Q678 (patch 0006): sorb over the UNSATURATED solid only. vcell*(1 - sat) is the exact
-        ! complement of MST's vcell*sat (gwt-mst.f90:355-377), with the same new/old pair MST uses
-        ! (gwfsat for v1, gwfsatold for v0), so each grain is counted once. gwfsatold is not
-        ! clipped by stock (tsp-fmi.f90:503-523), so both are clipped to [0,1] here. sat = 0 gives
-        ! vu = vcell*1.0 = vcell bit-exactly (c815ce2's value); sat = 1 gives vu = 0 and stock UZT
-        ! storage. theta_t is the wetness of that UNSATURATED volume (v/vu + thtr): c815ce2 divided
-        ! by the full vcell, which understated Sw and overstated A_aw wherever the water table sat
-        ! inside the cell.
-        node = this%cellnode(n1)
-        vu0 = vcell
-        vu1 = vcell
-        if (node > 0) then
-          vu0 = vcell * (DONE - min(DONE, max(DZERO, this%fmi%gwfsatold(node, delt))))
-          vu1 = vcell * (DONE - min(DONE, max(DZERO, this%fmi%gwfsat(node))))
-        end if
-        if (vu0 > DZERO) then
-          v0 = v0 + this%uzt_sorbed_vol(n1, vu0, v0 / vu0 + this%thtr(n1))
-        end if
-        if (vu1 > DZERO) then
-          v1 = v1 + this%uzt_sorbed_vol(n1, vu1, v1 / vu1 + this%thtr(n1))
-        end if
-      end if
+    ! Q685 (patch 0007): the capacity formula now lives in uzt_capacity and is called from BOTH
+    ! here and uzt_rinf_term/uzt_ritm_term, so the diagonal the storage term builds and the
+    ! condition the rejection branch tests can never disagree. The arithmetic is unchanged from
+    ! 0006: v = v_water + sorbed volume-equivalent over the UNSATURATED solid vcell*(1 - sat),
+    ! the exact complement of MST's vcell*sat, with gwfsatold for the old level and gwfsat for the
+    ! new, both clipped to [0,1] because stock does not clip gwfsatold (tsp-fmi.f90:503-523).
+    node = this%cellnode(n1)
+    sat0 = DZERO
+    sat1 = DZERO
+    if (node > 0) then
+      sat0 = this%fmi%gwfsatold(node, delt)
+      sat1 = this%fmi%gwfsat(node)
     end if
+    v0 = this%uzt_capacity(n1, v0, sat0)
+    v1 = this%uzt_capacity(n1, v1, sat1)
     !
     if (present(rrate)) then
       rrate = (-c1 * v1 / delt + c0 * v0 / delt) * this%eqnsclfac
@@ -1201,6 +1235,7 @@ contains
   !<
   subroutine uzt_rinf_term(this, ientry, n1, n2, rrate, &
                            rhsval, hcofval)
+    use TdisModule, only: delt
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: ientry
@@ -1212,14 +1247,47 @@ contains
     ! -- local
     real(DP) :: qbnd
     real(DP) :: ctmp
+    real(DP) :: v0, v1
+    real(DP) :: sat1
+    real(DP) :: cap
+    integer(I4B) :: node
     !
     n1 = this%flowbudptr%budterm(this%idxbudrinf)%id1(ientry)
     n2 = this%flowbudptr%budterm(this%idxbudrinf)%id2(ientry)
     qbnd = this%flowbudptr%budterm(this%idxbudrinf)%flow(ientry)
     ctmp = this%concinfl(n1)
+    !
+    ! -- Q685 (patch 0007). The rejected portion of the infiltration never entered the soil, so it
+    !    leaves at the INFILTRATION concentration -- what this routine's own header has always
+    !    said, and what its rrate has always printed. Stock handed the MATRIX hcofval = qbnd,
+    !    which removes at the FEATURE concentration instead, so the printed rate and the rate the
+    !    matrix implies (hcof*c1 - rhs) disagreed whenever c1 /= concinfl. The corrected form is
+    !    the same construction uzt_infl_term uses for its own inflow-concentration branch: the
+    !    whole term goes to RHS and the diagonal is untouched.
+    !
+    !    AT ZERO CAPACITY THE STOCK CONVENTION IS RETAINED, DELIBERATELY. With no mobile water and
+    !    no sorbent the feature stores nothing, the mass balance is satisfied for ANY c1, and the
+    !    two forms disagree only about how to NAME an undefined concentration -- not about mass.
+    !    Stock resolves that indeterminacy as c1 = concinfl; the corrected form would leave the row
+    !    with a ZERO DIAGONAL, and tsp-apt.f90 divides by it unguarded when the features are solved
+    !    explicitly. Measured on the Rogue 250 m deck: 399 features are dry-and-rejecting at some
+    !    step and 320 at one step, so this is the common case, not a corner. Applying the
+    !    correction only where capacity > 0 puts it exactly where the solver was wrongly retaining
+    !    mass and changes nothing where there is no mass to retain.
+    call this%apt_get_volumes(n1, v1, v0, delt)
+    node = this%cellnode(n1)
+    sat1 = DZERO
+    if (node > 0) sat1 = this%fmi%gwfsat(node)
+    cap = this%uzt_capacity(n1, v1, sat1)
+    !
     if (present(rrate)) rrate = ctmp * qbnd
-    if (present(rhsval)) rhsval = DZERO
-    if (present(hcofval)) hcofval = qbnd
+    if (cap > DZERO) then
+      if (present(rhsval)) rhsval = -qbnd * ctmp
+      if (present(hcofval)) hcofval = DZERO
+    else
+      if (present(rhsval)) rhsval = DZERO
+      if (present(hcofval)) hcofval = qbnd
+    end if
   end subroutine uzt_rinf_term
 
   !> @brief Evapotranspiration from the unsaturated-zone term
@@ -1268,6 +1336,7 @@ contains
   !<
   subroutine uzt_ritm_term(this, ientry, n1, n2, rrate, &
                            rhsval, hcofval)
+    use TdisModule, only: delt
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: ientry
@@ -1279,14 +1348,47 @@ contains
     ! -- local
     real(DP) :: qbnd
     real(DP) :: ctmp
+    real(DP) :: v0, v1
+    real(DP) :: sat1
+    real(DP) :: cap
+    integer(I4B) :: node
     !
     n1 = this%flowbudptr%budterm(this%idxbudritm)%id1(ientry)
     n2 = this%flowbudptr%budterm(this%idxbudritm)%id2(ientry)
     qbnd = this%flowbudptr%budterm(this%idxbudritm)%flow(ientry)
     ctmp = this%concinfl(n1)
+    !
+    ! -- Q685 (patch 0007). The rejected portion of the infiltration never entered the soil, so it
+    !    leaves at the INFILTRATION concentration -- what this routine's own header has always
+    !    said, and what its rrate has always printed. Stock handed the MATRIX hcofval = qbnd,
+    !    which removes at the FEATURE concentration instead, so the printed rate and the rate the
+    !    matrix implies (hcof*c1 - rhs) disagreed whenever c1 /= concinfl. The corrected form is
+    !    the same construction uzt_infl_term uses for its own inflow-concentration branch: the
+    !    whole term goes to RHS and the diagonal is untouched.
+    !
+    !    AT ZERO CAPACITY THE STOCK CONVENTION IS RETAINED, DELIBERATELY. With no mobile water and
+    !    no sorbent the feature stores nothing, the mass balance is satisfied for ANY c1, and the
+    !    two forms disagree only about how to NAME an undefined concentration -- not about mass.
+    !    Stock resolves that indeterminacy as c1 = concinfl; the corrected form would leave the row
+    !    with a ZERO DIAGONAL, and tsp-apt.f90 divides by it unguarded when the features are solved
+    !    explicitly. Measured on the Rogue 250 m deck: 399 features are dry-and-rejecting at some
+    !    step and 320 at one step, so this is the common case, not a corner. Applying the
+    !    correction only where capacity > 0 puts it exactly where the solver was wrongly retaining
+    !    mass and changes nothing where there is no mass to retain.
+    call this%apt_get_volumes(n1, v1, v0, delt)
+    node = this%cellnode(n1)
+    sat1 = DZERO
+    if (node > 0) sat1 = this%fmi%gwfsat(node)
+    cap = this%uzt_capacity(n1, v1, sat1)
+    !
     if (present(rrate)) rrate = ctmp * qbnd
-    if (present(rhsval)) rhsval = DZERO
-    if (present(hcofval)) hcofval = qbnd
+    if (cap > DZERO) then
+      if (present(rhsval)) rhsval = -qbnd * ctmp
+      if (present(hcofval)) hcofval = DZERO
+    else
+      if (present(rhsval)) rhsval = DZERO
+      if (present(hcofval)) hcofval = qbnd
+    end if
   end subroutine uzt_ritm_term
 
   !> @brief Define UZT Observation
