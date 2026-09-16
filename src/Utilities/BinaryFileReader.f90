@@ -7,7 +7,7 @@ module BinaryFileReaderModule
   public :: BinaryFileHeaderType, BinaryFileReaderType
 
   type :: BinaryFileHeaderType
-    ! Q692 (patch 0009): file POSITION and record SIZE are I8B, not I4B. A position held in
+    ! Q693 (patch 0009): file POSITION and record SIZE are I8B, not I4B. A position held in
     ! int32 cannot exceed 2,147,483,647 = 2 GiB - 1, and %pos is the seek-back target used by
     ! peek_record below (inquire at :114, read(pos=) at :117). Past the boundary the saved
     ! position is not representable, the seek-back lands mid-record, and the next header read
@@ -26,7 +26,7 @@ module BinaryFileReaderModule
     integer(I4B) :: nrecords
     logical(LGP) :: indexed
     logical(LGP) :: endoffile
-    integer(I8B), allocatable :: record_sizes(:)  ! Q692 (patch 0009): accumulates %size at :100
+    integer(I8B), allocatable :: record_sizes(:)  ! Q693 (patch 0009): accumulates %size at :100
     class(BinaryFileHeaderType), allocatable :: header
     class(BinaryFileHeaderType), allocatable :: headernext
   contains
@@ -76,7 +76,7 @@ contains
     class(BinaryFileReaderType), intent(inout) :: this
     ! local
     logical(LGP) :: success
-    integer(I8B) :: pos, record_size  ! Q692 (patch 0009): receives inquire(pos=) at :97
+    integer(I8B) :: pos, record_size  ! Q693 (patch 0009): receives inquire(pos=) at :97
 
     this%indexed = .false.
     this%nrecords = 0

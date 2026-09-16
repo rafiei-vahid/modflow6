@@ -1712,7 +1712,7 @@ contains
   subroutine fseek_stream(iu, offset, whence, status)
     ! -- dummy
     integer(I4B), intent(in) :: iu
-    integer(I8B), intent(in) :: offset  ! Q692 (patch 0009): added into the I8B ipos at :1733/:1738
+    integer(I8B), intent(in) :: offset  ! Q693 (patch 0009): added into the I8B ipos at :1733/:1738
     integer(I4B), intent(in) :: whence
     integer(I4B), intent(inout) :: status
     ! -- local

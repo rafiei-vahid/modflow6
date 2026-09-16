@@ -75,7 +75,7 @@ contains
     integer(I4B), intent(in), optional :: iout
     ! -- local
     integer(I4B) :: iostat
-    integer(I8B) :: pos  ! Q692 (patch 0009): receives inquire(pos=) at :97; iostat stays I4B
+    integer(I8B) :: pos  ! Q693 (patch 0009): receives inquire(pos=) at :97; iostat stays I4B
     !
     success = .true.
     select type (h => this%header)
