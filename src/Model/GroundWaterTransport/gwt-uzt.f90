@@ -1280,11 +1280,25 @@ contains
     if (node > 0) sat1 = this%fmi%gwfsat(node)
     cap = this%uzt_capacity(n1, v1, sat1)
     !
-    if (present(rrate)) rrate = ctmp * qbnd
     if (cap > DZERO) then
+      if (present(rrate)) rrate = ctmp * qbnd
       if (present(rhsval)) rhsval = -qbnd * ctmp
       if (present(hcofval)) hcofval = DZERO
     else
+      ! -- Q686 (patch 0008). On this branch the matrix removes at the FEATURE concentration
+      !    (hcofval = qbnd), so the rate it implies is qbnd*c1, and the print must say the same
+      !    thing or the budget cannot close -- the invariant rrate == hcof*c1 - rhs that every
+      !    other term in this file satisfies. Printing ctmp*qbnd here (concinfl) was correct
+      !    only while c1 == concinfl, which holds when the row has no other term; a cell that
+      !    saturates during the step releases its old-level sorbed pool into this row
+      !    (rhs -c0*v0/delt) with zero capacity left to hold it, c1 rises above concinfl, and
+      !    the released mass leaves with the rejected water at c1. Nothing else is
+      !    arithmetically possible there: the diagonal is qbnd alone, and moving the term to
+      !    the right-hand side would give 0*c1 = release, which has no solution. So the
+      !    matrix is left exactly as it was and the print is made to tell the truth about it.
+      !    Same construction as uzt_infl_term's qbnd < 0 branch. Measured on the Rogue 250 m
+      !    deck: 5 (feature, step) pairs, one feature, 2.63481 mass units carried the mismatch.
+      if (present(rrate)) rrate = qbnd * this%xnewpak(n1)
       if (present(rhsval)) rhsval = DZERO
       if (present(hcofval)) hcofval = qbnd
     end if
@@ -1381,11 +1395,25 @@ contains
     if (node > 0) sat1 = this%fmi%gwfsat(node)
     cap = this%uzt_capacity(n1, v1, sat1)
     !
-    if (present(rrate)) rrate = ctmp * qbnd
     if (cap > DZERO) then
+      if (present(rrate)) rrate = ctmp * qbnd
       if (present(rhsval)) rhsval = -qbnd * ctmp
       if (present(hcofval)) hcofval = DZERO
     else
+      ! -- Q686 (patch 0008). On this branch the matrix removes at the FEATURE concentration
+      !    (hcofval = qbnd), so the rate it implies is qbnd*c1, and the print must say the same
+      !    thing or the budget cannot close -- the invariant rrate == hcof*c1 - rhs that every
+      !    other term in this file satisfies. Printing ctmp*qbnd here (concinfl) was correct
+      !    only while c1 == concinfl, which holds when the row has no other term; a cell that
+      !    saturates during the step releases its old-level sorbed pool into this row
+      !    (rhs -c0*v0/delt) with zero capacity left to hold it, c1 rises above concinfl, and
+      !    the released mass leaves with the rejected water at c1. Nothing else is
+      !    arithmetically possible there: the diagonal is qbnd alone, and moving the term to
+      !    the right-hand side would give 0*c1 = release, which has no solution. So the
+      !    matrix is left exactly as it was and the print is made to tell the truth about it.
+      !    Same construction as uzt_infl_term's qbnd < 0 branch. Measured on the Rogue 250 m
+      !    deck: 5 (feature, step) pairs, one feature, 2.63481 mass units carried the mismatch.
+      if (present(rrate)) rrate = qbnd * this%xnewpak(n1)
       if (present(rhsval)) rhsval = DZERO
       if (present(hcofval)) hcofval = qbnd
     end if
