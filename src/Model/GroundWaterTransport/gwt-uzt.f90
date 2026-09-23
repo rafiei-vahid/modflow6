@@ -715,10 +715,12 @@ contains
   !> @brief Q616 DEBUG ONLY: engine view of patch 0006's inputs (never used for a reported number)
   subroutine uzt_q616_dump(this)
     class(GwtUztType) :: this
-    integer(I4B) :: n, node, cnt, nsatpos, nu, numin, numax
+    integer(I4B) :: n, node, cnt, nsatpos, nu, numin, numax, nsat1, k, nr
+    integer(I4B), dimension(4) :: samp
     real(DP) :: s, smin, smax
     cnt = 0
     nsatpos = 0
+    nsat1 = 0
     numin = huge(1)
     numax = -1
     smin = 1.0d30
@@ -731,6 +733,7 @@ contains
         smin = min(smin, s)
         smax = max(smax, s)
         if (s > DZERO) nsatpos = nsatpos + 1
+        if (s >= DONE) nsat1 = nsat1 + 1
         nu = this%dis%get_nodeuser(node)
         numin = min(numin, nu)
         numax = max(numax, nu)
@@ -739,6 +742,21 @@ contains
     write (this%iout, '(a,5(1x,i0),2(1x,es14.6))') &
       'Q616DEBUG ncv cnt_node_gt0 n_sat_gt0 nodeuser_min nodeuser_max sat_min sat_max:', &
       this%ncv, cnt, nsatpos, numin, numax, smin, smax
+    write (this%iout, '(a,1x,i0)') 'Q616DEBUG n_sat_ge1:', nsat1
+    samp = (/ 1, min(2, this%ncv), max(1, this%ncv / 2), this%ncv /)
+    do k = 1, 4
+      n = samp(k)
+      node = this%cellnode(n)
+      if (node > 0) then
+        nu = this%dis%get_nodeuser(node)
+        nr = this%dis%get_nodenumber(node, 0)
+        write (this%iout, '(a,4(1x,i0),1x,es14.6)') &
+          'Q616DEBUG feature id2_stored nodeuser(id2) reduced_if_id2_is_user sat(id2):', &
+          n, node, nu, nr, this%fmi%gwfsat(node)
+      else
+        write (this%iout, '(a,2(1x,i0))') 'Q616DEBUG feature cellnode==0:', n, node
+      end if
+    end do
   end subroutine uzt_q616_dump
 
   function uzt_cellvol(this, n) result(vcell)
