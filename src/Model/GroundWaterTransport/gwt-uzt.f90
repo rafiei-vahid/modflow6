@@ -39,6 +39,7 @@ module GwtUztModule
   use IsothermEnumModule, only: SORPTION_OFF, SORPTION_LINEAR, &
                                 SORPTION_FREUND, SORPTION_LANG
   implicit none
+  integer(I4B), save :: q616_nprint = 0 ! Q616 DEBUG ONLY: never a reported number
 
   public uzt_create
 
@@ -112,6 +113,7 @@ module GwtUztModule
     procedure :: uzt_capacity
     procedure :: uzt_retardation
     procedure :: uzt_cellvol
+    procedure :: uzt_q616_dump
 
   end type GwtUztType
 
@@ -710,6 +712,35 @@ contains
   !! budget term (id1 = feature, id2 = node), and the volume is area*(top-bot), the same form
   !! gwt-mst.f90 uses. Walked once per feature and cached; the budget list does not move.
   !<
+  !> @brief Q616 DEBUG ONLY: engine view of patch 0006's inputs (never used for a reported number)
+  subroutine uzt_q616_dump(this)
+    class(GwtUztType) :: this
+    integer(I4B) :: n, node, cnt, nsatpos, nu, numin, numax
+    real(DP) :: s, smin, smax
+    cnt = 0
+    nsatpos = 0
+    numin = huge(1)
+    numax = -1
+    smin = 1.0d30
+    smax = -1.0d30
+    do n = 1, this%ncv
+      node = this%cellnode(n)
+      if (node > 0) then
+        cnt = cnt + 1
+        s = this%fmi%gwfsat(node)
+        smin = min(smin, s)
+        smax = max(smax, s)
+        if (s > DZERO) nsatpos = nsatpos + 1
+        nu = this%dis%get_nodeuser(node)
+        numin = min(numin, nu)
+        numax = max(numax, nu)
+      end if
+    end do
+    write (this%iout, '(a,5(1x,i0),2(1x,es14.6))') &
+      'Q616DEBUG ncv cnt_node_gt0 n_sat_gt0 nodeuser_min nodeuser_max sat_min sat_max:', &
+      this%ncv, cnt, nsatpos, numin, numax, smin, smax
+  end subroutine uzt_q616_dump
+
   function uzt_cellvol(this, n) result(vcell)
     ! -- dummy
     class(GwtUztType) :: this
@@ -982,6 +1013,10 @@ contains
     end if
     v0 = this%uzt_capacity(n1, v0, sat0)
     v1 = this%uzt_capacity(n1, v1, sat1)
+    if (n1 == this%ncv .and. q616_nprint < 3) then
+      q616_nprint = q616_nprint + 1
+      call this%uzt_q616_dump()
+    end if
     !
     if (present(rrate)) then
       rrate = (-c1 * v1 / delt + c0 * v0 / delt) * this%eqnsclfac
