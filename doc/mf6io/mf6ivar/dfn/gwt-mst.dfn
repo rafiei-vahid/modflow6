@@ -101,6 +101,15 @@ extended true
 
 # --------------------- gwt mst griddata ---------------------
 
+block options
+name dry_cell_zero_sat_inactive
+type keyword
+reader urword
+optional true
+mf6internal drycellinact
+longname deactivate transport in zero-saturation cells
+description keyword (rafiei-vahid fork, Q1041 patch E) to make a transport cell inactive whenever its flow saturation is zero, as MODFLOW 6 already does for a DHDRY cell. Under the Newton-Raphson formulation a dry cell keeps a head below its bottom and is otherwise never deactivated, while every storage and sorption term scales with the saturation. The mass a newly deactivated cell held is booked as a storage release and an equal DRY-CELL outflow in the MST budget.
+
 block griddata
 name porosity
 type double precision

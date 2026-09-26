@@ -27,10 +27,10 @@ module GwtMstModule
   public :: GwtMstType
   public :: mst_cr
   !
-  integer(I4B), parameter :: NBDITEMS = 4
+  integer(I4B), parameter :: NBDITEMS = 5
   character(len=LENBUDTXT), dimension(NBDITEMS) :: budtxt
   data budtxt/' STORAGE-AQUEOUS', '   DECAY-AQUEOUS', &
-    '  STORAGE-SORBED', '    DECAY-SORBED'/
+    '  STORAGE-SORBED', '    DECAY-SORBED', '        DRY-CELL'/
 
   !> @brief Enumerator that defines the decay options
   !<
@@ -75,6 +75,8 @@ module GwtMstModule
     ! -- misc
     integer(I4B), dimension(:), pointer, contiguous :: ibound => null() !< pointer to model ibound
     type(TspFmiType), pointer :: fmi => null() !< pointer to fmi object
+    integer(I4B) :: izerosat = 0 !< Q1041 patch E (rafiei-vahid fork): 1 = DRY_CELL_ZERO_SAT_INACTIVE
+    real(DP), dimension(:), allocatable :: ratedry !< Q1041 patch E: DRY-CELL mass rate per cell (negative = out of the domain)
 
   contains
 
@@ -487,6 +489,12 @@ contains
     real(DP), intent(in), dimension(nodes) :: cold !< concentration at end of last time step
     real(DP), dimension(:), contiguous, intent(inout) :: flowja !< flow between two connected control volumes
     !
+    ! -- Q1041 patch E: reset the per-step DRY-CELL rates
+    if (this%izerosat /= 0) then
+      if (.not. allocated(this%ratedry)) allocate (this%ratedry(nodes))
+      this%ratedry(:) = DZERO
+    end if
+    !
     ! - storage
     call this%mst_cq_sto(nodes, cnew, cold, flowja)
     !
@@ -540,7 +548,21 @@ contains
       this%ratesto(n) = DZERO
       !
       ! -- skip if transport inactive
-      if (this%ibound(n) <= 0) cycle
+      if (this%ibound(n) <= 0) then
+        ! -- Q1041 patch E: a cell deactivated THIS step releases the aqueous mass it held (vnew = 0 at zero
+        !    saturation, so vold is the storage-flow term alone); booked as STORAGE in and DRY-CELL out.
+        if (this%izerosat /= 0 .and. allocated(this%fmi%idrynew)) then
+          if (this%fmi%idrynew(n) == 1) then
+            vold = DZERO
+            if (this%fmi%igwfstrgss /= 0) vold = vold + this%fmi%gwfstrgss(n) * delt
+            if (this%fmi%igwfstrgsy /= 0) vold = vold + this%fmi%gwfstrgsy(n) * delt
+            rate = vold * tled * cold(n)
+            this%ratesto(n) = rate
+            this%ratedry(n) = this%ratedry(n) - rate
+          end if
+        end if
+        cycle
+      end if
       !
       ! -- calculate new and old water volumes
       vnew = this%dis%area(n) * (this%dis%top(n) - this%dis%bot(n)) * &
@@ -650,7 +672,21 @@ contains
       rate = 0.0_dp
       !
       ! -- skip if transport inactive
-      if (this%ibound(n) <= 0) cycle
+      if (this%ibound(n) <= 0) then
+        ! -- Q1041 patch E: the sorbed mass a cell held when deactivated THIS step (sat_new = 0), released and booked
+        if (this%izerosat /= 0 .and. allocated(this%fmi%idrynew)) then
+          if (this%fmi%idrynew(n) == 1) then
+            Vcell = this%dis%area(n) * (this%dis%top(n) - this%dis%bot(n))
+            rhobm = this%bulk_density(n)
+            volfracm = this%get_volfracm(n)
+            sat_old = this%fmi%gwfsatold(n, delt)
+            rate = volfracm * rhobm * sat_old * this%isotherm%value(cold, n) * Vcell * tled
+            this%ratesrb(n) = rate
+            this%ratedry(n) = this%ratedry(n) - rate
+          end if
+        end if
+        cycle
+      end if
       !
       ! -- assign variables
       Vcell = this%dis%area(n) * (this%dis%top(n) - this%dis%bot(n))
@@ -843,6 +879,15 @@ contains
       call rate_accumulator(this%ratedcys, rin, rout)
       call model_budget%addentry(rin, rout, delt, budtxt(4), &
                                  isuppress_output, rowlabel=this%packName)
+    end if
+    !
+    ! -- Q1041 patch E: DRY-CELL (mass removed with cells deactivated at zero saturation)
+    if (this%izerosat /= 0) then
+      if (allocated(this%ratedry)) then
+        call rate_accumulator(this%ratedry, rin, rout)
+        call model_budget%addentry(rin, rout, delt, budtxt(5), &
+                                   isuppress_output, rowlabel=this%packName)
+      end if
     end if
   end subroutine mst_bd
 
@@ -1114,6 +1159,8 @@ contains
     character(len=LENVARNAME), dimension(3) :: sorption_method = &
       &[character(len=LENVARNAME) :: 'LINEAR', 'FREUNDLICH', 'LANGMUIR']
     character(len=LINELENGTH) :: fname
+    integer(I4B), target :: ikw
+    integer(I4B), pointer :: pkw
     !
     ! -- update defaults with memory sourced values
     call mem_set_value(this%ipakcb, 'SAVE_FLOWS', this%input_mempath, &
@@ -1126,10 +1173,17 @@ contains
                        sorption_method, found%sorption)
     call mem_set_value(fname, 'SORBATEFILE', this%input_mempath, &
                        found%sorbatefile)
+    pkw => ikw
+    call mem_set_value(pkw, 'DRYCELLINACT', this%input_mempath, &
+                       found%drycellinact)
 
     ! -- found side effects
     if (found%save_flows) this%ipakcb = -1
     if (found%order1_decay) this%idcy = DECAY_FIRST_ORDER
+    if (found%drycellinact) then
+      this%izerosat = 1
+      this%fmi%izerosatinact = 1
+    end if
     if (found%order0_decay) this%idcy = DECAY_ZERO_ORDER
     if (found%sorption) then
       if (this%isrb == IZERO) then
@@ -1177,6 +1231,10 @@ contains
       &'OPENED ON UNIT: ',I7)"
 
     write (this%iout, '(1x,a)') 'PROCESSING MOBILE STORAGE AND TRANSFER OPTIONS'
+    if (found%drycellinact) then
+      write (this%iout, '(4x,a)') 'DRY_CELL_ZERO_SAT_INACTIVE: a cell at zero flow saturation is INACTIVE for &
+        &transport; the mass it held when deactivated is booked as DRY-CELL (Q1041 patch E, rafiei-vahid fork).'
+    end if
     if (found%save_flows) then
       write (this%iout, fmtisvflow)
     end if

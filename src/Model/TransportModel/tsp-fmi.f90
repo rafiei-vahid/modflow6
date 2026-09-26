@@ -43,6 +43,8 @@ module TspFmiModule
     type(DataAdvancedPackageType), &
       dimension(:), pointer, contiguous :: datp => null()
     type(BudObjPtrArray), dimension(:), allocatable :: aptbudobj !< flow budget objects for the advanced packages
+    integer(I4B) :: izerosatinact = 0 !< Q1041 patch E (rafiei-vahid fork): 1 = a cell at zero flow saturation is inactive for transport
+    integer(I4B), dimension(:), allocatable :: idrynew !< Q1041 patch E: 1 where set_active_status deactivated the cell THIS step
 
   contains
 
@@ -436,6 +438,11 @@ contains
     character(len=*), parameter :: fmtoutmsg2 = &
       &"(1x,'DRY CELL REACTIVATED AT', a, 'WITH STARTING', a, '=', G13.5)"
     !
+    ! -- Q1041 patch E: per-step record of the cells this routine deactivates (read by MST for the DRY-CELL budget)
+    if (this%izerosatinact /= 0) then
+      if (.not. allocated(this%idrynew)) allocate (this%idrynew(this%dis%nodes))
+      this%idrynew(:) = 0
+    end if
     do n = 1, this%dis%nodes
       ! -- Calculate the ibound-like array that has 0 if saturation
       !    is zero and 1 otherwise
@@ -447,9 +454,11 @@ contains
       !
       ! -- Check if active transport cell is inactive for flow
       if (this%ibound(n) > 0) then
-        if (this%gwfhead(n) == DHDRY) then
-          ! -- transport cell should be made inactive
+        if (this%gwfhead(n) == DHDRY .or. &
+            (this%izerosatinact /= 0 .and. this%gwfsat(n) <= DZERO)) then
+          ! -- transport cell should be made inactive (Q1041 patch E: also at zero flow saturation, when opted in)
           this%ibound(n) = 0
+          if (this%izerosatinact /= 0) this%idrynew(n) = 1
           cnew(n) = DHDRY
           call this%dis%noder_to_string(n, nodestr)
           write (this%iout, fmtoutmsg1) &
@@ -463,7 +472,8 @@ contains
       !
       ! -- Convert dry transport cell to active if flow has rewet
       if (cnew(n) == DHDRY) then
-        if (this%gwfhead(n) /= DHDRY) then
+        if (this%gwfhead(n) /= DHDRY .and. &
+            (this%izerosatinact == 0 .or. this%gwfsat(n) > DZERO)) then
           !
           ! -- obtain weighted concentration/temperature
           crewet = DZERO
