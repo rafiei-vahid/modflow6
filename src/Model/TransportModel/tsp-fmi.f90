@@ -34,6 +34,13 @@ module TspFmiModule
     type(BudgetObjectType), pointer :: ptr
   end type BudObjPtrArray
 
+  !> Q1041 E v3 (rafiei-vahid fork): the final destinations of one E-inactive cell's inflowing mass
+  type :: RouteDestType
+    integer(I4B), dimension(:), allocatable :: t !< 1 = active receiver cell, 2 = sink at an E-inactive cell
+    integer(I4B), dimension(:), allocatable :: n !< the receiver node (1) or the E-inactive node holding the sink (2)
+    real(DP), dimension(:), allocatable :: f !< fraction of the cell's inflowing mass reaching it
+  end type RouteDestType
+
   type, extends(FlowModelInterfaceType) :: TspFmiType
 
     integer(I4B), dimension(:), pointer, contiguous :: iatp => null() !< advanced transport package applied to gwfpackages
@@ -45,6 +52,27 @@ module TspFmiModule
     type(BudObjPtrArray), dimension(:), allocatable :: aptbudobj !< flow budget objects for the advanced packages
     integer(I4B) :: izerosatinact = 0 !< Q1041 patch E (rafiei-vahid fork): 1 = a cell at zero flow saturation is inactive for transport
     integer(I4B), dimension(:), allocatable :: idrynew !< Q1041 patch E: 1 where set_active_status deactivated the cell THIS step
+    ! -- Q1041 E v3 (rafiei-vahid fork): advected mass follows the water through E-inactive cells (DRY_CELL_ROUTE_MASS)
+    integer(I4B) :: iroute = 0 !< 1 = route the mass (requires izerosatinact)
+    integer(I4B), dimension(:), allocatable :: rstat !< per node: 0 not E-inactive, 1 routable E-inactive, 2 isolated E-inactive
+    integer(I4B), dimension(:), allocatable :: rpos !< per node: position in rinode (0 if not E-inactive)
+    integer(I4B) :: nri = 0 !< number of E-inactive cells this step
+    integer(I4B), dimension(:), allocatable :: rinode !< the E-inactive cells
+    integer(I4B), dimension(:), allocatable :: rdia !< per rinode position: start of its final-destination list (nri + 1)
+    integer(I4B), dimension(:), allocatable :: rdtype !< 1 = active receiver, 2 = sink
+    integer(I4B), dimension(:), allocatable :: rdnode !< receiver node (1) or the E-inactive node holding the sink (2)
+    real(DP), dimension(:), allocatable :: rdfrac !< fraction of the inflowing mass reaching the destination
+    real(DP), dimension(:), allocatable :: raptlag !< per node: advanced-package mass into an E-inactive cell, fc iterate
+    integer(I4B) :: naptc = 0 !< converged advanced-package connections into E-inactive cells (this step)
+    integer(I4B), dimension(:), allocatable :: raptf, raptm !< feature and cell of each
+    real(DP), dimension(:), allocatable :: raptw, raptq !< water rate and mass rate (Q x C_feature, converged) of each
+    integer(I4B) :: nro = 0 !< ROUTED list length
+    integer(I4B) :: nrs = 0 !< ROUTED-SINK list length
+    integer(I4B) :: nrw = 0 !< WITHHELD-ISOL list length
+    integer(I4B), dimension(:), allocatable :: ronode, roid2, rsnode, rsid2, rwnode, rwid2
+    real(DP), dimension(:), allocatable :: roq, rsq, rwq
+    real(DP) :: rsumd_fc = DZERO !< sum of the deliveries the last outer iteration applied
+    integer(I4B) :: ritprint = 0 !< E3-ITERATE printed
 
   contains
 
@@ -66,6 +94,12 @@ module TspFmiModule
     procedure :: set_aptbudobj_pointer
     procedure :: source_packagedata => gwtfmi_source_packagedata
     procedure :: set_active_status
+    procedure :: route_build
+    procedure :: route_fc_reset
+    procedure :: route_fc
+    procedure :: route_cq_reset
+    procedure :: route_apt_final
+    procedure :: route_cq
 
   end type TspFmiType
 
@@ -181,6 +215,8 @@ contains
     ! -- set inactive transport cell status
     if (this%idryinactive /= 0) then
       call this%set_active_status(cnew)
+      ! -- Q1041 E v3: this step's routing table, from this step's flows and active set
+      if (this%iroute /= 0) call this%route_build()
     end if
   end subroutine fmi_ad
 
@@ -917,5 +953,463 @@ contains
       call this%gwfpackages(n)%da()
     end do
   end subroutine gwtfmi_deallocate_gwfpackages
+
+  !> @brief Q1041 E v3 (rafiei-vahid fork): build this step's routing table
+  !!
+  !! An E-inactive cell (ibound 0 under DRY_CELL_ZERO_SAT_INACTIVE) holds no water. The water it receives leaves
+  !! by its outflows: faces to active cells, faces to other E-inactive cells (a chain, composed top-down), and
+  !! sinks (non-advanced GWF packages with outflow at the cell). The mass that arrives with the water is split
+  !! over the FINAL destinations by flow share. A cell whose EFFECTIVE outflow (outflows that deliver) is zero is
+  !! isolated (rstat 2): its active senders keep their mass (D1), and no chain routes mass into it. A routing
+  !! cycle among E-inactive cells, and an advanced package gaining water from an E-inactive cell, are FATAL.
+  !<
+  subroutine route_build(this)
+    ! -- dummy
+    class(TspFmiType) :: this
+    ! -- local
+    integer(I4B) :: nodes, n, m, j, ipos, ip, i, k, c, d, e, nd, nq, iq, nout, nleft
+    integer(I4B), dimension(:), allocatable :: oia, otype, otgt, indeg, cursor, kq, topo
+    real(DP), dimension(:), allocatable :: oq, effout
+    real(DP) :: q, f
+    type(RouteDestType), dimension(:), allocatable :: fin
+    character(len=LINELENGTH) :: cellstr
+    !
+    nodes = this%dis%nodes
+    if (.not. allocated(this%rstat)) then
+      allocate (this%rstat(nodes), this%rpos(nodes), this%raptlag(nodes))
+      this%raptlag(:) = DZERO
+    end if
+    this%rstat(:) = 0
+    this%rpos(:) = 0
+    !
+    ! -- 1. the E-inactive cells
+    this%nri = 0
+    do n = 1, nodes
+      if (this%ibound(n) == 0) this%nri = this%nri + 1
+    end do
+    if (allocated(this%rinode)) deallocate (this%rinode)
+    allocate (this%rinode(this%nri))
+    k = 0
+    do n = 1, nodes
+      if (this%ibound(n) == 0) then
+        k = k + 1
+        this%rinode(k) = n
+        this%rpos(n) = k
+        this%rstat(n) = 1
+      end if
+    end do
+    !
+    ! -- 2. direct outflows of each E-inactive cell: 1 face to an active cell, 3 face to an E-inactive cell,
+    !       2 sink (a non-advanced GWF package taking water out at the cell)
+    allocate (oia(this%nri + 1))
+    oia(:) = 0
+    do k = 1, this%nri
+      m = this%rinode(k)
+      do ipos = this%dis%con%ia(m) + 1, this%dis%con%ia(m + 1) - 1
+        if (this%dis%con%mask(ipos) == 0) cycle
+        if (this%gwfflowja(ipos) < DZERO) oia(k + 1) = oia(k + 1) + 1
+      end do
+    end do
+    do ip = 1, this%nflowpack
+      do i = 1, this%gwfpackages(ip)%nbound
+        n = this%gwfpackages(ip)%nodelist(i)
+        if (n <= 0) cycle
+        if (this%rpos(n) == 0) cycle
+        q = this%gwfpackages(ip)%get_flow(i)
+        if (q < DZERO) then
+          if (this%iatp(ip) /= 0) then
+            call this%dis%noder_to_string(n, cellstr)
+            write (errmsg, '(a,a,a,a,a,es15.6,a)') &
+              'Q1041 E v3: the advanced package ', trim(this%flowpacknamearray(ip)), &
+              ' GAINS water from the E-inactive cell ', trim(cellstr), ' (', q, &
+              '); routing mass into a feature is not implemented.'
+            call store_error(errmsg, terminate=.TRUE.)
+          end if
+          oia(this%rpos(n) + 1) = oia(this%rpos(n) + 1) + 1
+        end if
+      end do
+    end do
+    oia(1) = 1
+    do k = 1, this%nri
+      oia(k + 1) = oia(k + 1) + oia(k)
+    end do
+    nout = oia(this%nri + 1) - 1
+    allocate (otype(max(nout, 1)), otgt(max(nout, 1)), oq(max(nout, 1)))
+    allocate (indeg(max(this%nri, 1)), cursor(max(this%nri, 1)))
+    indeg(:) = 0
+    if (this%nri > 0) cursor(1:this%nri) = oia(1:this%nri)
+    do k = 1, this%nri
+      m = this%rinode(k)
+      do ipos = this%dis%con%ia(m) + 1, this%dis%con%ia(m + 1) - 1
+        if (this%dis%con%mask(ipos) == 0) cycle
+        q = this%gwfflowja(ipos)
+        if (q < DZERO) then
+          j = this%dis%con%ja(ipos)
+          e = cursor(k)
+          cursor(k) = e + 1
+          oq(e) = -q
+          if (this%rpos(j) /= 0) then
+            otype(e) = 3
+            otgt(e) = this%rpos(j)
+            indeg(this%rpos(j)) = indeg(this%rpos(j)) + 1
+          else
+            otype(e) = 1
+            otgt(e) = j
+          end if
+        end if
+      end do
+    end do
+    do ip = 1, this%nflowpack
+      do i = 1, this%gwfpackages(ip)%nbound
+        n = this%gwfpackages(ip)%nodelist(i)
+        if (n <= 0) cycle
+        if (this%rpos(n) == 0) cycle
+        q = this%gwfpackages(ip)%get_flow(i)
+        if (q < DZERO) then
+          k = this%rpos(n)
+          e = cursor(k)
+          cursor(k) = e + 1
+          otype(e) = 2
+          otgt(e) = n
+          oq(e) = -q
+        end if
+      end do
+    end do
+    !
+    ! -- 3. upstream-first order over E-inactive -> E-inactive faces (Kahn); a cycle is FATAL
+    allocate (kq(max(this%nri, 1)), topo(max(this%nri, 1)))
+    nq = 0
+    do k = 1, this%nri
+      if (indeg(k) == 0) then
+        nq = nq + 1
+        kq(nq) = k
+      end if
+    end do
+    iq = 1
+    c = 0
+    do while (iq <= nq)
+      k = kq(iq)
+      iq = iq + 1
+      c = c + 1
+      topo(c) = k
+      do e = oia(k), oia(k + 1) - 1
+        if (otype(e) /= 3) cycle
+        indeg(otgt(e)) = indeg(otgt(e)) - 1
+        if (indeg(otgt(e)) == 0) then
+          nq = nq + 1
+          kq(nq) = otgt(e)
+        end if
+      end do
+    end do
+    if (c < this%nri) then
+      nleft = 0
+      do k = 1, this%nri
+        if (indeg(k) > 0) then
+          nleft = nleft + 1
+          if (nleft <= 20) then
+            call this%dis%noder_to_string(this%rinode(k), cellstr)
+            write (this%iout, '(1x,a,a)') 'E3-CYCLE cell ', trim(cellstr)
+          end if
+        end if
+      end do
+      write (errmsg, '(a,i0,a)') 'Q1041 E v3: a routing CYCLE among E-inactive cells (', nleft, &
+        ' cells in or below it; the first 20 are printed as E3-CYCLE lines in the listing).'
+      call store_error(errmsg, terminate=.TRUE.)
+    end if
+    !
+    ! -- 4. downstream first: effective outflow, isolation, and the final destinations with their fractions
+    allocate (effout(max(this%nri, 1)), fin(max(this%nri, 1)))
+    do c = this%nri, 1, -1
+      k = topo(c)
+      m = this%rinode(k)
+      effout(k) = DZERO
+      do e = oia(k), oia(k + 1) - 1
+        if (otype(e) == 3) then
+          if (this%rstat(this%rinode(otgt(e))) == 1) effout(k) = effout(k) + oq(e)
+        else
+          effout(k) = effout(k) + oq(e)
+        end if
+      end do
+      if (effout(k) <= DZERO) then
+        this%rstat(m) = 2
+        allocate (fin(k)%t(0), fin(k)%n(0), fin(k)%f(0))
+        cycle
+      end if
+      nd = 0
+      do e = oia(k), oia(k + 1) - 1
+        if (otype(e) == 3) then
+          if (this%rstat(this%rinode(otgt(e))) == 1) nd = nd + size(fin(otgt(e))%t)
+        else
+          nd = nd + 1
+        end if
+      end do
+      allocate (fin(k)%t(nd), fin(k)%n(nd), fin(k)%f(nd))
+      d = 0
+      do e = oia(k), oia(k + 1) - 1
+        f = oq(e) / effout(k)
+        if (otype(e) == 3) then
+          j = otgt(e)
+          if (this%rstat(this%rinode(j)) == 1) then
+            do i = 1, size(fin(j)%t)
+              d = d + 1
+              fin(k)%t(d) = fin(j)%t(i)
+              fin(k)%n(d) = fin(j)%n(i)
+              fin(k)%f(d) = f * fin(j)%f(i)
+            end do
+          end if
+        else
+          d = d + 1
+          fin(k)%t(d) = otype(e)
+          fin(k)%n(d) = otgt(e)
+          fin(k)%f(d) = f
+        end if
+      end do
+    end do
+    !
+    ! -- 5. flatten into a CSR over the rinode positions
+    if (allocated(this%rdia)) deallocate (this%rdia)
+    if (allocated(this%rdtype)) deallocate (this%rdtype, this%rdnode, this%rdfrac)
+    allocate (this%rdia(this%nri + 1))
+    this%rdia(1) = 1
+    do k = 1, this%nri
+      this%rdia(k + 1) = this%rdia(k) + size(fin(k)%t)
+    end do
+    nd = this%rdia(this%nri + 1) - 1
+    allocate (this%rdtype(max(nd, 1)), this%rdnode(max(nd, 1)), this%rdfrac(max(nd, 1)))
+    do k = 1, this%nri
+      d = this%rdia(k)
+      do i = 1, size(fin(k)%t)
+        this%rdtype(d) = fin(k)%t(i)
+        this%rdnode(d) = fin(k)%n(i)
+        this%rdfrac(d) = fin(k)%f(i)
+        d = d + 1
+      end do
+    end do
+    deallocate (oia, otype, otgt, oq, indeg, cursor, kq, topo, effout, fin)
+  end subroutine route_build
+
+  !> @brief Q1041 E v3: clear the advanced-package routing registrations before an outer iteration's fill
+  !<
+  subroutine route_fc_reset(this)
+    class(TspFmiType) :: this
+    if (allocated(this%raptlag)) this%raptlag(:) = DZERO
+  end subroutine route_fc_reset
+
+  !> @brief Q1041 E v3: deliver the routed mass to the active receivers (explicit, Picard-lagged)
+  !!
+  !! Called after every package's fill in the same outer iteration: each routable E-inactive cell's inflowing
+  !! mass (faces from active cells at the current iterate, first-order upwind; advanced packages as registered
+  !! by their fill) is added as a source to its final receivers by flow share. The senders' loss is implicit
+  !! in the advection fill, so the two agree at convergence.
+  !<
+  subroutine route_fc(this, cnew, rhs)
+    class(TspFmiType) :: this
+    real(DP), dimension(:), intent(in) :: cnew
+    real(DP), dimension(:), intent(inout) :: rhs
+    integer(I4B) :: k, m, ipos, j, d
+    real(DP) :: q, fin, sumd
+    !
+    sumd = DZERO
+    if (.not. allocated(this%rstat)) return
+    do k = 1, this%nri
+      m = this%rinode(k)
+      if (this%rstat(m) /= 1) cycle
+      fin = this%raptlag(m)
+      do ipos = this%dis%con%ia(m) + 1, this%dis%con%ia(m + 1) - 1
+        if (this%dis%con%mask(ipos) == 0) cycle
+        j = this%dis%con%ja(ipos)
+        if (this%ibound(j) == 0) cycle
+        q = this%gwfflowja(ipos)
+        if (q > DZERO) fin = fin + q * this%eqnsclfac * cnew(j)
+      end do
+      do d = this%rdia(k), this%rdia(k + 1) - 1
+        if (this%rdtype(d) == 1) then
+          rhs(this%rdnode(d)) = rhs(this%rdnode(d)) - this%rdfrac(d) * fin
+          sumd = sumd + this%rdfrac(d) * fin
+        end if
+      end do
+    end do
+    this%rsumd_fc = sumd
+  end subroutine route_fc
+
+  !> @brief Q1041 E v3: clear the converged advanced-package registrations before a step's flow calculation
+  !<
+  subroutine route_cq_reset(this)
+    class(TspFmiType) :: this
+    this%naptc = 0
+  end subroutine route_cq_reset
+
+  !> @brief Q1041 E v3: register one losing advanced-package connection into an E-inactive cell (converged)
+  !<
+  subroutine route_apt_final(this, ifeat, node, qwater, qmass)
+    class(TspFmiType) :: this
+    integer(I4B), intent(in) :: ifeat
+    integer(I4B), intent(in) :: node
+    real(DP), intent(in) :: qwater
+    real(DP), intent(in) :: qmass
+    if (.not. allocated(this%raptf)) then
+      allocate (this%raptf(64), this%raptm(64), this%raptw(64), this%raptq(64))
+    end if
+    if (this%naptc + 1 > size(this%raptf)) then
+      call route_grow_i(this%raptf)
+      call route_grow_i(this%raptm)
+      call route_grow_d(this%raptw)
+      call route_grow_d(this%raptq)
+    end if
+    this%naptc = this%naptc + 1
+    this%raptf(this%naptc) = ifeat
+    this%raptm(this%naptc) = node
+    this%raptw(this%naptc) = qwater
+    this%raptq(this%naptc) = qmass
+  end subroutine route_apt_final
+
+  !> @brief Q1041 E v3: book the routed mass from the CONVERGED iterate, and print the E3 lines
+  !!
+  !! ROUTED: - at each active sender (the face's q x C_sender), + at each receiver (its share; id2 = the feature
+  !! for an advanced-package origin, else 0). ROUTED-SINK: - at the E-inactive cell of each sink. WITHHELD-ISOL:
+  !! + at the sender for a face into an isolated cell (kept there, D1), + at the cell for an advanced-package
+  !! connection into an isolated cell (the feature loses it, as E v2 does). Each ROUTED entry is also added to
+  !! the cell's flowja diagonal, so the per-cell residual stays closed.
+  !<
+  subroutine route_cq(this, cnew, flowja)
+    use TdisModule, only: kper, kstp
+    class(TspFmiType) :: this
+    real(DP), dimension(:), intent(in) :: cnew
+    real(DP), dimension(:), contiguous, intent(inout) :: flowja
+    integer(I4B) :: k, m, ipos, j, d, c, niso
+    integer(I4B), dimension(:), allocatable :: isoin
+    real(DP) :: q, mass, fin, share, sumd, ftot, atot, wsum, qfaces, qapt
+    !
+    this%nro = 0
+    this%nrs = 0
+    this%nrw = 0
+    sumd = DZERO
+    ftot = DZERO
+    atot = DZERO
+    wsum = DZERO
+    qfaces = DZERO
+    qapt = DZERO
+    if (.not. allocated(this%rstat)) return
+    allocate (isoin(max(this%nri, 1)))
+    isoin(:) = 0
+    do k = 1, this%nri
+      m = this%rinode(k)
+      fin = DZERO
+      do ipos = this%dis%con%ia(m) + 1, this%dis%con%ia(m + 1) - 1
+        if (this%dis%con%mask(ipos) == 0) cycle
+        j = this%dis%con%ja(ipos)
+        if (this%ibound(j) == 0) cycle
+        q = this%gwfflowja(ipos)
+        if (q <= DZERO) cycle
+        mass = q * this%eqnsclfac * cnew(j)
+        qfaces = qfaces + q
+        if (this%rstat(m) == 1) then
+          call route_push(this%nro, this%ronode, this%roid2, this%roq, j, 0, -mass)
+          flowja(this%dis%con%ia(j)) = flowja(this%dis%con%ia(j)) - mass
+          ftot = ftot + mass
+          fin = fin + mass
+        else
+          call route_push(this%nrw, this%rwnode, this%rwid2, this%rwq, j, 0, mass)
+          wsum = wsum + mass
+          isoin(k) = 1
+        end if
+      end do
+      if (this%rstat(m) == 1) then
+        do d = this%rdia(k), this%rdia(k + 1) - 1
+          share = this%rdfrac(d) * fin
+          if (this%rdtype(d) == 1) then
+            call route_push(this%nro, this%ronode, this%roid2, this%roq, this%rdnode(d), 0, share)
+            flowja(this%dis%con%ia(this%rdnode(d))) = flowja(this%dis%con%ia(this%rdnode(d))) + share
+            sumd = sumd + share
+          else
+            call route_push(this%nrs, this%rsnode, this%rsid2, this%rsq, this%rdnode(d), 0, -share)
+          end if
+        end do
+      end if
+    end do
+    do c = 1, this%naptc
+      m = this%raptm(c)
+      k = this%rpos(m)
+      mass = this%raptq(c)
+      qapt = qapt + this%raptw(c)
+      atot = atot + mass
+      if (k > 0) then
+        if (this%rstat(m) == 1) then
+          do d = this%rdia(k), this%rdia(k + 1) - 1
+            share = this%rdfrac(d) * mass
+            if (this%rdtype(d) == 1) then
+              call route_push(this%nro, this%ronode, this%roid2, this%roq, this%rdnode(d), &
+                              this%raptf(c), share)
+              flowja(this%dis%con%ia(this%rdnode(d))) = flowja(this%dis%con%ia(this%rdnode(d))) + share
+              sumd = sumd + share
+            else
+              call route_push(this%nrs, this%rsnode, this%rsid2, this%rsq, this%rdnode(d), &
+                              this%raptf(c), -share)
+            end if
+          end do
+          cycle
+        end if
+        isoin(k) = 1
+      end if
+      call route_push(this%nrw, this%rwnode, this%rwid2, this%rwq, m, this%raptf(c), mass)
+      wsum = wsum + mass
+    end do
+    niso = 0
+    do k = 1, this%nri
+      if (isoin(k) == 1) niso = niso + 1
+    end do
+    deallocate (isoin)
+    if (this%ritprint == 0) then
+      write (this%iout, '(/1x,a)') 'E3-ITERATE converged'
+      write (this%iout, '(1x,a)') 'Q1041 E v3: ROUTED, ROUTED-SINK and WITHHELD-ISOL are booked from the CONVERGED &
+        &iterate; E3-LAG dROUTED_IN = |deliveries at the converged iterate - deliveries the last outer iteration &
+        &applied|; ROUTED_OUT = face mass removed at senders + advanced-package mass into E-inactive cells.'
+      this%ritprint = 1
+    end if
+    write (this%iout, '(1x,a,2(1x,i0),1x,es24.16e3,1x,i0)') 'E3-ISOLATED', kper, kstp, wsum, niso
+    write (this%iout, '(1x,a,2(1x,i0),2(1x,es24.16e3))') 'E3-LAG', kper, kstp, abs(sumd - this%rsumd_fc), &
+      ftot + atot
+    write (this%iout, '(1x,a,2(1x,i0),2(1x,es24.16e3))') 'E3-QROUTED', kper, kstp, qfaces, qapt
+  end subroutine route_cq
+
+  !> @brief Q1041 E v3: append one entry to a routing output list
+  !<
+  subroutine route_push(nlist, anode, aid2, aq, node, id2, q)
+    integer(I4B), intent(inout) :: nlist
+    integer(I4B), dimension(:), allocatable, intent(inout) :: anode
+    integer(I4B), dimension(:), allocatable, intent(inout) :: aid2
+    real(DP), dimension(:), allocatable, intent(inout) :: aq
+    integer(I4B), intent(in) :: node
+    integer(I4B), intent(in) :: id2
+    real(DP), intent(in) :: q
+    if (.not. allocated(anode)) then
+      allocate (anode(256), aid2(256), aq(256))
+    end if
+    if (nlist + 1 > size(anode)) then
+      call route_grow_i(anode)
+      call route_grow_i(aid2)
+      call route_grow_d(aq)
+    end if
+    nlist = nlist + 1
+    anode(nlist) = node
+    aid2(nlist) = id2
+    aq(nlist) = q
+  end subroutine route_push
+
+  subroutine route_grow_i(a)
+    integer(I4B), dimension(:), allocatable, intent(inout) :: a
+    integer(I4B), dimension(:), allocatable :: b
+    allocate (b(2 * max(size(a), 32)))
+    b(1:size(a)) = a
+    call move_alloc(b, a)
+  end subroutine route_grow_i
+
+  subroutine route_grow_d(a)
+    real(DP), dimension(:), allocatable, intent(inout) :: a
+    real(DP), dimension(:), allocatable :: b
+    allocate (b(2 * max(size(a), 32)))
+    b(1:size(a)) = a
+    call move_alloc(b, a)
+  end subroutine route_grow_d
 
 end module TspFmiModule

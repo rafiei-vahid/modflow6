@@ -281,6 +281,19 @@ contains
     nbound_flow = this%fmi%gwfpackages(ipackage)%nbound
     n = this%fmi%gwfpackages(ipackage)%nodelist(ientry)
     !
+    ! -- Q1041 E v3: E v3 routes only mass that arrives by advection; a source concentration flowing into an
+    !    E-inactive cell is not routed, so it stops the run instead of being dropped silently
+    if (this%fmi%iroute /= 0 .and. n > 0) then
+      if (this%ibound(n) == 0 .and. this%isrctype(ipackage) /= 0) then
+        if (this%fmi%gwfpackages(ipackage)%get_flow(ientry) > 0.0_DP) then
+          write (errmsg, '(a,a,a)') 'Q1041 E v3: the SSM source ', &
+            trim(this%fmi%flowpacknamearray(ipackage)), &
+            ' flows into an E-inactive cell; routing a source concentration is not implemented.'
+          call store_error(errmsg, terminate=.TRUE.)
+        end if
+      end if
+    end if
+    !
     ! -- If cell is active (ibound > 0) then calculate values
     if (this%ibound(n) > 0) then
       !

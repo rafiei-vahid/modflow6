@@ -854,6 +854,7 @@ contains
     ! -- local
     real(DP) :: rin
     real(DP) :: rout
+    integer(I4B) :: i
     !
     ! -- sto
     call rate_accumulator(this%ratesto, rin, rout)
@@ -888,6 +889,23 @@ contains
         call model_budget%addentry(rin, rout, delt, budtxt(5), &
                                    isuppress_output, rowlabel=this%packName)
       end if
+    end if
+    !
+    ! -- Q1041 E v3: ROUTED (IN = deliveries at receivers, OUT = removals at senders; the net is the
+    !    advanced-package mass entering E-inactive cells less the sink shares). ROUTED-SINK and WITHHELD-ISOL are
+    !    diagnostic records only: adding them here would count that mass twice.
+    if (this%fmi%iroute /= 0) then
+      rin = DZERO
+      rout = DZERO
+      do i = 1, this%fmi%nro
+        if (this%fmi%roq(i) > DZERO) then
+          rin = rin + this%fmi%roq(i)
+        else
+          rout = rout - this%fmi%roq(i)
+        end if
+      end do
+      call model_budget%addentry(rin, rout, delt, '          ROUTED', &
+                                 isuppress_output, rowlabel=this%packName)
     end if
   end subroutine mst_bd
 
@@ -943,8 +961,43 @@ contains
         call this%dis%record_array(this%ratedcys, this%iout, iprint, -ibinun, &
                                    budtxt(4), cdatafmp, nvaluesp, &
                                    nwidthp, editdesc, dinact)
+      !
+      ! -- Q1041 E v3: ROUTED, ROUTED-SINK and WITHHELD-ISOL as lists (node = the GWT cell; id2 = 0 for a face
+      !    origin, else the advanced-package feature); written even when empty, so absent never means zero
+      if (this%fmi%iroute /= 0) then
+        call mst_route_list(this, '          ROUTED', this%fmi%nro, this%fmi%ronode, &
+                            this%fmi%roid2, this%fmi%roq, ibinun)
+        call mst_route_list(this, '     ROUTED-SINK', this%fmi%nrs, this%fmi%rsnode, &
+                            this%fmi%rsid2, this%fmi%rsq, ibinun)
+        call mst_route_list(this, '   WITHHELD-ISOL', this%fmi%nrw, this%fmi%rwnode, &
+                            this%fmi%rwid2, this%fmi%rwq, ibinun)
+      end if
     end if
   end subroutine mst_ot_flow
+
+  !> @brief Q1041 E v3: write one routing list record to the model budget file
+  !<
+  subroutine mst_route_list(this, text, nlist, anode, aid2, aq, ibinun)
+    class(GwtMstType) :: this
+    character(len=16), intent(in) :: text
+    integer(I4B), intent(in) :: nlist
+    integer(I4B), dimension(:), allocatable, intent(in) :: anode
+    integer(I4B), dimension(:), allocatable, intent(in) :: aid2
+    real(DP), dimension(:), allocatable, intent(in) :: aq
+    integer(I4B), intent(in) :: ibinun
+    character(len=16), dimension(1) :: auxname
+    real(DP), dimension(1) :: auxrow
+    integer(I4B) :: i
+    auxname(1) = ''
+    auxrow(1) = DZERO
+    call this%dis%record_srcdst_list_header(text, this%name_model, this%name_model, &
+                                            this%name_model, this%packName, 0, &
+                                            auxname, ibinun, nlist, this%iout)
+    do i = 1, nlist
+      call this%dis%record_mf6_list_entry(ibinun, anode(i), aid2(i), aq(i), 0, &
+                                          auxrow, olconv2=.FALSE.)
+    end do
+  end subroutine mst_route_list
 
   !> @brief Save sorbate concentration array to binary file
   !<
@@ -1160,6 +1213,7 @@ contains
       &[character(len=LENVARNAME) :: 'LINEAR', 'FREUNDLICH', 'LANGMUIR']
     character(len=LINELENGTH) :: fname
     integer(I4B), target :: ikw
+    integer(I4B), target :: ikw2
     integer(I4B), pointer :: pkw
     !
     ! -- update defaults with memory sourced values
@@ -1176,6 +1230,9 @@ contains
     pkw => ikw
     call mem_set_value(pkw, 'DRYCELLINACT', this%input_mempath, &
                        found%drycellinact)
+    pkw => ikw2
+    call mem_set_value(pkw, 'DRYCELLROUTE', this%input_mempath, &
+                       found%drycellroute)
 
     ! -- found side effects
     if (found%save_flows) this%ipakcb = -1
@@ -1183,6 +1240,15 @@ contains
     if (found%drycellinact) then
       this%izerosat = 1
       this%fmi%izerosatinact = 1
+    end if
+    if (found%drycellroute) then
+      if (.not. found%drycellinact) then
+        call store_error('DRY_CELL_ROUTE_MASS requires DRY_CELL_ZERO_SAT_INACTIVE &
+                         &(Q1041 E v3, rafiei-vahid fork).')
+        call store_error_filename(this%input_fname)
+      else
+        this%fmi%iroute = 1
+      end if
     end if
     if (found%order0_decay) this%idcy = DECAY_ZERO_ORDER
     if (found%sorption) then
@@ -1234,6 +1300,11 @@ contains
     if (found%drycellinact) then
       write (this%iout, '(4x,a)') 'DRY_CELL_ZERO_SAT_INACTIVE: a cell at zero flow saturation is INACTIVE for &
         &transport; the mass it held when deactivated is booked as DRY-CELL (Q1041 patch E, rafiei-vahid fork).'
+    end if
+    if (found%drycellroute) then
+      write (this%iout, '(4x,a)') 'DRY_CELL_ROUTE_MASS: mass advected into an E-inactive cell follows the water &
+        &through it, split over its outflows by flow share (first-order upwind), booked as ROUTED; ROUTED-SINK and &
+        &WITHHELD-ISOL are saved as diagnostic records (Q1041 E v3, rafiei-vahid fork).'
     end if
     if (found%save_flows) then
       write (this%iout, fmtisvflow)

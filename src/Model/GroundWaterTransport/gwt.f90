@@ -433,6 +433,9 @@ contains
     class(BndType), pointer :: packobj
     integer(I4B) :: ip
     !
+    ! -- Q1041 E v3: clear last iteration's advanced-package routing registrations
+    if (this%fmi%iroute /= 0) call this%fmi%route_fc_reset()
+    !
     ! -- call fc routines
     call this%fmi%fmi_fc(this%dis%nodes, this%xold, this%nja, matrix_sln, &
                          this%idxglo, this%rhs)
@@ -460,6 +463,9 @@ contains
       packobj => GetBndFromList(this%bndlist, ip)
       call packobj%bnd_fc(this%rhs, this%ia, this%idxglo, matrix_sln)
     end do
+    !
+    ! -- Q1041 E v3: deliver the mass routed through E-inactive cells (after every package's fill)
+    if (this%fmi%iroute /= 0) call this%fmi%route_fc(this%x, this%rhs)
   end subroutine gwt_fc
 
   !> @brief GWT Model Final Convergence Check
@@ -512,6 +518,7 @@ contains
     do i = 1, this%nja
       this%flowja(i) = DZERO
     end do
+    if (this%fmi%iroute /= 0) call this%fmi%route_cq_reset()
     if (this%inadv > 0) call this%adv%adv_cq(this%x, this%flowja)
     if (this%indsp > 0) call this%dsp%dsp_cq(this%x, this%flowja)
     if (this%inmst > 0) call this%mst%mst_cq(this%dis%nodes, this%x, this%xold, &
@@ -527,6 +534,9 @@ contains
       call packobj%bnd_cf()
       call packobj%bnd_cq(this%x, this%flowja)
     end do
+    !
+    ! -- Q1041 E v3: book the routed mass from the CONVERGED iterate (after the packages' cq registered theirs)
+    if (this%fmi%iroute /= 0) call this%fmi%route_cq(this%x, this%flowja)
     !
     ! -- Finalize calculation of flowja by adding face flows to the diagonal.
     !    This results in the flow residual being stored in the diagonal
