@@ -906,6 +906,11 @@ contains
       end do
       call model_budget%addentry(rin, rout, delt, '          ROUTED', &
                                  isuppress_output, rowlabel=this%packName)
+      ! -- ROUTED-CNC: a constant-concentration cell supplies the routed mass it sends (IN) and takes the routed mass
+      !    delivered to it (OUT); the CNC package does not book faces to inactive neighbours (gwt-cnc.f90 cnc_cq,
+      !    ibound(n2) > 0), so without this entry the model budget would carry exactly that mass as a discrepancy
+      call model_budget%addentry(this%fmi%rcncin, this%fmi%rcncout, delt, '      ROUTED-CNC', &
+                                 isuppress_output, rowlabel=this%packName)
     end if
   end subroutine mst_bd
 

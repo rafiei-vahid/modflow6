@@ -39,6 +39,7 @@ module TspFmiModule
     integer(I4B), dimension(:), allocatable :: t !< 1 = active receiver cell, 2 = sink at an E-inactive cell
     integer(I4B), dimension(:), allocatable :: n !< the receiver node (1) or the E-inactive node holding the sink (2)
     real(DP), dimension(:), allocatable :: f !< fraction of the cell's inflowing mass reaching it
+    integer(I4B), dimension(:), allocatable :: p !< receivers: flowja position of the face (receiver, adjacent E-inactive cell)
   end type RouteDestType
 
   type, extends(FlowModelInterfaceType) :: TspFmiType
@@ -62,6 +63,8 @@ module TspFmiModule
     integer(I4B), dimension(:), allocatable :: rdtype !< 1 = active receiver, 2 = sink
     integer(I4B), dimension(:), allocatable :: rdnode !< receiver node (1) or the E-inactive node holding the sink (2)
     real(DP), dimension(:), allocatable :: rdfrac !< fraction of the inflowing mass reaching the destination
+    integer(I4B), dimension(:), allocatable :: rdpos !< receivers: flowja position in the receiver's row of its face with
+                                                     !! the adjacent E-inactive cell (the routed mass enters there)
     real(DP), dimension(:), allocatable :: raptlag !< per node: advanced-package mass into an E-inactive cell, fc iterate
     integer(I4B) :: naptc = 0 !< converged advanced-package connections into E-inactive cells (this step)
     integer(I4B), dimension(:), allocatable :: raptf, raptm !< feature and cell of each
@@ -72,6 +75,8 @@ module TspFmiModule
     integer(I4B), dimension(:), allocatable :: ronode, roid2, rsnode, rsid2, rwnode, rwid2
     real(DP), dimension(:), allocatable :: roq, rsq, rwq
     real(DP) :: rsumd_fc = DZERO !< sum of the deliveries the last outer iteration applied
+    real(DP) :: rcncin = DZERO !< routed mass leaving constant-concentration senders (the boundary supplies it)
+    real(DP) :: rcncout = DZERO !< routed mass delivered to constant-concentration receivers (the boundary takes it)
     integer(I4B) :: ritprint = 0 !< E3-ITERATE printed
 
   contains
@@ -98,6 +103,7 @@ module TspFmiModule
     procedure :: route_fc_reset
     procedure :: route_fc
     procedure :: route_cq_reset
+    procedure :: route_cq_faces
     procedure :: route_apt_final
     procedure :: route_cq
 
@@ -968,7 +974,7 @@ contains
     class(TspFmiType) :: this
     ! -- local
     integer(I4B) :: nodes, n, m, j, ipos, ip, i, k, c, d, e, nd, nq, iq, nout, nleft
-    integer(I4B), dimension(:), allocatable :: oia, otype, otgt, indeg, cursor, kq, topo
+    integer(I4B), dimension(:), allocatable :: oia, otype, otgt, indeg, cursor, kq, topo, opos, hasapt
     real(DP), dimension(:), allocatable :: oq, effout
     real(DP) :: q, f
     type(RouteDestType), dimension(:), allocatable :: fin
@@ -1034,9 +1040,11 @@ contains
       oia(k + 1) = oia(k + 1) + oia(k)
     end do
     nout = oia(this%nri + 1) - 1
-    allocate (otype(max(nout, 1)), otgt(max(nout, 1)), oq(max(nout, 1)))
-    allocate (indeg(max(this%nri, 1)), cursor(max(this%nri, 1)))
+    allocate (otype(max(nout, 1)), otgt(max(nout, 1)), oq(max(nout, 1)), opos(max(nout, 1)))
+    allocate (indeg(max(this%nri, 1)), cursor(max(this%nri, 1)), hasapt(max(this%nri, 1)))
     indeg(:) = 0
+    opos(:) = 0
+    hasapt(:) = 0
     if (this%nri > 0) cursor(1:this%nri) = oia(1:this%nri)
     do k = 1, this%nri
       m = this%rinode(k)
@@ -1055,6 +1063,7 @@ contains
           else
             otype(e) = 1
             otgt(e) = j
+            opos(e) = this%dis%con%isym(ipos)
           end if
         end if
       end do
@@ -1072,6 +1081,8 @@ contains
           otype(e) = 2
           otgt(e) = n
           oq(e) = -q
+        else if (q > DZERO .and. this%iatp(ip) /= 0) then
+          hasapt(this%rpos(n)) = 1
         end if
       end do
     end do
@@ -1132,7 +1143,7 @@ contains
       end do
       if (effout(k) <= DZERO) then
         this%rstat(m) = 2
-        allocate (fin(k)%t(0), fin(k)%n(0), fin(k)%f(0))
+        allocate (fin(k)%t(0), fin(k)%n(0), fin(k)%f(0), fin(k)%p(0))
         cycle
       end if
       nd = 0
@@ -1143,7 +1154,7 @@ contains
           nd = nd + 1
         end if
       end do
-      allocate (fin(k)%t(nd), fin(k)%n(nd), fin(k)%f(nd))
+      allocate (fin(k)%t(nd), fin(k)%n(nd), fin(k)%f(nd), fin(k)%p(nd))
       d = 0
       do e = oia(k), oia(k + 1) - 1
         f = oq(e) / effout(k)
@@ -1155,6 +1166,7 @@ contains
               fin(k)%t(d) = fin(j)%t(i)
               fin(k)%n(d) = fin(j)%n(i)
               fin(k)%f(d) = f * fin(j)%f(i)
+              fin(k)%p(d) = fin(j)%p(i)
             end do
           end if
         else
@@ -1162,30 +1174,46 @@ contains
           fin(k)%t(d) = otype(e)
           fin(k)%n(d) = otgt(e)
           fin(k)%f(d) = f
+          fin(k)%p(d) = opos(e)
         end if
       end do
+      ! -- advanced-package mass is delivered after the packages' flow calculation, too late for a constant-
+      !    concentration receiver's own balance: such a route stops the run instead of mis-booking
+      if (hasapt(k) /= 0) then
+        do d = 1, nd
+          if (fin(k)%t(d) == 1) then
+            if (this%ibound(fin(k)%n(d)) < 0) then
+              call this%dis%noder_to_string(fin(k)%n(d), cellstr)
+              write (errmsg, '(a,a,a)') 'Q1041 E v3: advanced-package mass routed through an E-inactive cell &
+                &would reach the constant-concentration cell ', trim(cellstr), '; not implemented.'
+              call store_error(errmsg, terminate=.TRUE.)
+            end if
+          end if
+        end do
+      end if
     end do
     !
     ! -- 5. flatten into a CSR over the rinode positions
     if (allocated(this%rdia)) deallocate (this%rdia)
-    if (allocated(this%rdtype)) deallocate (this%rdtype, this%rdnode, this%rdfrac)
+    if (allocated(this%rdtype)) deallocate (this%rdtype, this%rdnode, this%rdfrac, this%rdpos)
     allocate (this%rdia(this%nri + 1))
     this%rdia(1) = 1
     do k = 1, this%nri
       this%rdia(k + 1) = this%rdia(k) + size(fin(k)%t)
     end do
     nd = this%rdia(this%nri + 1) - 1
-    allocate (this%rdtype(max(nd, 1)), this%rdnode(max(nd, 1)), this%rdfrac(max(nd, 1)))
+    allocate (this%rdtype(max(nd, 1)), this%rdnode(max(nd, 1)), this%rdfrac(max(nd, 1)), this%rdpos(max(nd, 1)))
     do k = 1, this%nri
       d = this%rdia(k)
       do i = 1, size(fin(k)%t)
         this%rdtype(d) = fin(k)%t(i)
         this%rdnode(d) = fin(k)%n(i)
         this%rdfrac(d) = fin(k)%f(i)
+        this%rdpos(d) = fin(k)%p(i)
         d = d + 1
       end do
     end do
-    deallocate (oia, otype, otgt, oq, indeg, cursor, kq, topo, effout, fin)
+    deallocate (oia, otype, otgt, oq, opos, indeg, cursor, hasapt, kq, topo, effout, fin)
   end subroutine route_build
 
   !> @brief Q1041 E v3: clear the advanced-package routing registrations before an outer iteration's fill
@@ -1231,6 +1259,43 @@ contains
     end do
     this%rsumd_fc = sumd
   end subroutine route_fc
+
+  !> @brief Q1041 E v3: the face part of the routed mass in flowja, BEFORE the packages' flow calculation
+  !!
+  !! A constant-concentration package balances the FACE flows of its cell (gwt-cnc.f90 cnc_cq sums the off-diagonal
+  !! flowja), so the routed mass must sit at faces, and before that package runs: the sender's removal at the face
+  !! (sender, E-inactive cell), and each face-origin delivery at the face (receiver, adjacent E-inactive cell). The
+  !! advanced-package deliveries follow in route_cq, at faces too (a constant-concentration receiver of those is FATAL
+  !! in route_build).
+  !<
+  subroutine route_cq_faces(this, cnew, flowja)
+    class(TspFmiType) :: this
+    real(DP), dimension(:), intent(in) :: cnew
+    real(DP), dimension(:), contiguous, intent(inout) :: flowja
+    integer(I4B) :: k, m, ipos, j, d, jpos
+    real(DP) :: q, mass, fin
+    !
+    if (.not. allocated(this%rstat)) return
+    do k = 1, this%nri
+      m = this%rinode(k)
+      if (this%rstat(m) /= 1) cycle
+      fin = DZERO
+      do ipos = this%dis%con%ia(m) + 1, this%dis%con%ia(m + 1) - 1
+        if (this%dis%con%mask(ipos) == 0) cycle
+        j = this%dis%con%ja(ipos)
+        if (this%ibound(j) == 0) cycle
+        q = this%gwfflowja(ipos)
+        if (q <= DZERO) cycle
+        mass = q * this%eqnsclfac * cnew(j)
+        fin = fin + mass
+        jpos = this%dis%con%isym(ipos)
+        flowja(jpos) = flowja(jpos) - mass
+      end do
+      do d = this%rdia(k), this%rdia(k + 1) - 1
+        if (this%rdtype(d) == 1) flowja(this%rdpos(d)) = flowja(this%rdpos(d)) + this%rdfrac(d) * fin
+      end do
+    end do
+  end subroutine route_cq_faces
 
   !> @brief Q1041 E v3: clear the converged advanced-package registrations before a step's flow calculation
   !<
@@ -1283,6 +1348,8 @@ contains
     this%nro = 0
     this%nrs = 0
     this%nrw = 0
+    this%rcncin = DZERO
+    this%rcncout = DZERO
     sumd = DZERO
     ftot = DZERO
     atot = DZERO
@@ -1305,7 +1372,7 @@ contains
         qfaces = qfaces + q
         if (this%rstat(m) == 1) then
           call route_push(this%nro, this%ronode, this%roid2, this%roq, j, 0, -mass)
-          flowja(this%dis%con%ia(j)) = flowja(this%dis%con%ia(j)) - mass
+          if (this%ibound(j) < 0) this%rcncin = this%rcncin + mass
           ftot = ftot + mass
           fin = fin + mass
         else
@@ -1319,7 +1386,7 @@ contains
           share = this%rdfrac(d) * fin
           if (this%rdtype(d) == 1) then
             call route_push(this%nro, this%ronode, this%roid2, this%roq, this%rdnode(d), 0, share)
-            flowja(this%dis%con%ia(this%rdnode(d))) = flowja(this%dis%con%ia(this%rdnode(d))) + share
+            if (this%ibound(this%rdnode(d)) < 0) this%rcncout = this%rcncout + share
             sumd = sumd + share
           else
             call route_push(this%nrs, this%rsnode, this%rsid2, this%rsq, this%rdnode(d), 0, -share)
@@ -1340,7 +1407,8 @@ contains
             if (this%rdtype(d) == 1) then
               call route_push(this%nro, this%ronode, this%roid2, this%roq, this%rdnode(d), &
                               this%raptf(c), share)
-              flowja(this%dis%con%ia(this%rdnode(d))) = flowja(this%dis%con%ia(this%rdnode(d))) + share
+              if (this%ibound(this%rdnode(d)) < 0) this%rcncout = this%rcncout + share
+              flowja(this%rdpos(d)) = flowja(this%rdpos(d)) + share
               sumd = sumd + share
             else
               call route_push(this%nrs, this%rsnode, this%rsid2, this%rsq, this%rdnode(d), &

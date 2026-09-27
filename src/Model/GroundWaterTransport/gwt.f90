@@ -520,6 +520,8 @@ contains
     end do
     if (this%fmi%iroute /= 0) call this%fmi%route_cq_reset()
     if (this%inadv > 0) call this%adv%adv_cq(this%x, this%flowja)
+    ! -- Q1041 E v3: the routed mass at FACES, before any package balances its cell's faces (CNC)
+    if (this%fmi%iroute /= 0) call this%fmi%route_cq_faces(this%x, this%flowja)
     if (this%indsp > 0) call this%dsp%dsp_cq(this%x, this%flowja)
     if (this%inmst > 0) call this%mst%mst_cq(this%dis%nodes, this%x, this%xold, &
                                              this%flowja)
