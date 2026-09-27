@@ -247,7 +247,8 @@ contains
             if (allocated(this%fmi%rstat)) then
               if (this%fmi%rstat(m) == 1) then
                 qnm = this%fmi%gwfflowja(ipos) * this%eqnsclfac
-                if (qnm < 0.0_DP) call matrix_sln%add_value_pos(idxglo(idiag), qnm)
+                ! -- DELIBERATELY BROKEN BUILD (Q1041 E v3 control 2b): the sender keeps the mass it routes
+                if (qnm < 0.0_DP) qnm = qnm
               end if
             end if
           end if
