@@ -1371,7 +1371,7 @@ contains
         mass = q * this%eqnsclfac * cnew(j)
         qfaces = qfaces + q
         if (this%rstat(m) == 1) then
-          call route_push(this%nro, this%ronode, this%roid2, this%roq, j, 0, -mass)
+          ! -- DELIBERATELY BROKEN BUILD (Q1041 E v3 control 2a): the senders are NOT booked in ROUTED
           if (this%ibound(j) < 0) this%rcncin = this%rcncin + mass
           ftot = ftot + mass
           fin = fin + mass
