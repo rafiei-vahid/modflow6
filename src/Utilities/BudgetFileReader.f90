@@ -127,7 +127,8 @@ contains
     logical, intent(out) :: success
     integer(I4B), intent(in), optional :: iout
     ! -- local
-    integer(I4B) :: iostat, pos
+    integer(I4B) :: iostat
+    integer(I8B) :: pos  ! (patch 0009): receives inquire(pos=) at :181; iostat stays I4B
     character(len=LINELENGTH) :: errmsg
     !
     success = .true.

@@ -239,7 +239,20 @@ contains
       idiag = this%dis%con%ia(n)
       do ipos = this%dis%con%ia(n) + 1, this%dis%con%ia(n + 1) - 1
         m = this%dis%con%ja(ipos)
-        if (this%ibound(m) == 0) cycle ! skip inactive nodes
+        if (this%ibound(m) == 0) then
+          ! -- E v3 (rafiei-vahid fork): water leaving n into a ROUTABLE E-inactive cell takes its mass
+          !    with it, first-order upwind and implicit at n; fmi route_fc delivers that mass with the water.
+          !    A face into an ISOLATED E-inactive cell keeps the mass at n (D1), as E v2 does for every face.
+          if (this%fmi%iroute /= 0 .and. this%dis%con%mask(ipos) /= 0) then
+            if (allocated(this%fmi%rstat)) then
+              if (this%fmi%rstat(m) == 1) then
+                qnm = this%fmi%gwfflowja(ipos) * this%eqnsclfac
+                if (qnm < 0.0_DP) call matrix_sln%add_value_pos(idxglo(idiag), qnm)
+              end if
+            end if
+          end if
+          cycle ! skip inactive nodes
+        end if
         if (this%dis%con%mask(ipos) == 0) cycle ! skip masked connections
 
         qnm = this%fmi%gwfflowja(ipos) * this%eqnsclfac

@@ -746,6 +746,11 @@ contains
     ! -- add hcof and rhs terms (from apt_solve) to the gwf matrix
     do j = 1, this%flowbudptr%budterm(this%idxbudgwf)%nlist
       igwfnode = this%flowbudptr%budterm(this%idxbudgwf)%id2(j)
+      if (this%fmi%iroute /= 0 .and. this%ibound(igwfnode) == 0) then
+        write (errmsg, '(a)') 'DRY_CELL_ROUTE_MASS is not implemented for an advanced package &
+          &with DEV_NONEXPANDING_MATRIX that connects to an E-inactive cell.'
+        call store_error(errmsg, terminate=.TRUE.)
+      end if
       if (this%ibound(igwfnode) < 1) cycle
       idiag = idxglo(ia(igwfnode))
       call matrix_sln%add_value_pos(idiag, this%hcof(j))
@@ -771,6 +776,8 @@ contains
     integer(I4B) :: iloc
     integer(I4B) :: iposd, iposoffd
     integer(I4B) :: ipossymd, ipossymoffd
+    integer(I4B) :: igwfnode
+    logical(LGP) :: lrouted
     real(DP) :: cold
     real(DP) :: qbnd, qbnd_scaled
     real(DP) :: omega
@@ -828,17 +835,36 @@ contains
         if (qbnd < DZERO) omega = DONE
         qbnd_scaled = qbnd * this%eqnsclfac
         !
-        ! -- add to apt row
+        ! -- E v3: is the GWT cell of this connection E-inactive?
+        igwfnode = this%flowbudptr%budterm(this%idxbudgwf)%id2(j)
+        lrouted = .false.
+        if (this%fmi%iroute /= 0) then
+          if (this%ibound(igwfnode) == 0) lrouted = .true.
+        end if
+        !
+        ! -- add to apt row (a feature never reads an E-inactive cell's C: gaining from one is FATAL in route_build)
         iposd = this%idxdglo(j)
         iposoffd = this%idxoffdglo(j)
-        call matrix_sln%add_value_pos(iposd, omega * qbnd_scaled)
-        call matrix_sln%add_value_pos(iposoffd, (DONE - omega) * qbnd_scaled)
+        if (.not. (lrouted .and. qbnd > DZERO)) then
+          call matrix_sln%add_value_pos(iposd, omega * qbnd_scaled)
+          call matrix_sln%add_value_pos(iposoffd, (DONE - omega) * qbnd_scaled)
+        end if
         !
         ! -- add to gwf row for apt connection
-        ipossymd = this%idxsymdglo(j)
-        ipossymoffd = this%idxsymoffdglo(j)
-        call matrix_sln%add_value_pos(ipossymd, -(DONE - omega) * qbnd_scaled)
-        call matrix_sln%add_value_pos(ipossymoffd, -omega * qbnd_scaled)
+        if (lrouted) then
+          ! -- E v3: the solver discards an inactive row (NumericalSolution inactive-row reset), so the
+          !    leakage mass is delivered with the water by fmi route_fc instead, at this iterate's feature C
+          if (qbnd < DZERO .and. allocated(this%fmi%rstat)) then
+            if (this%fmi%rstat(igwfnode) == 1) then
+              this%fmi%raptlag(igwfnode) = this%fmi%raptlag(igwfnode) - qbnd_scaled * this%xnewpak(n)
+            end if
+          end if
+        else
+          ipossymd = this%idxsymdglo(j)
+          ipossymoffd = this%idxsymoffdglo(j)
+          call matrix_sln%add_value_pos(ipossymd, -(DONE - omega) * qbnd_scaled)
+          call matrix_sln%add_value_pos(ipossymoffd, -omega * qbnd_scaled)
+        end if
       end if
     end do
     !
@@ -926,7 +952,9 @@ contains
     integer(I4B), optional, intent(in) :: iadv
     ! -- local
     integer(I4B) :: n, n1, n2
+    integer(I4B) :: j, igwfnode
     real(DP) :: rrate
+    real(DP) :: qbnd
     !
     ! -- Solve the feature concentrations (or temperatures) again or update
     !    the feature hcof and rhs terms
@@ -938,6 +966,22 @@ contains
     !
     ! -- call base functionality in bnd_cq
     call this%BndType%bnd_cq(x, flowja)
+    !
+    ! -- E v3: register each LOSING connection into an E-inactive cell at the CONVERGED feature
+    !    concentration (the stream loses Q x C_f there; fmi route_cq books where that mass goes)
+    if (this%fmi%iroute /= 0) then
+      do j = 1, this%flowbudptr%budterm(this%idxbudgwf)%nlist
+        n = this%flowbudptr%budterm(this%idxbudgwf)%id1(j)
+        igwfnode = this%flowbudptr%budterm(this%idxbudgwf)%id2(j)
+        if (this%iboundpak(n) == 0) cycle
+        if (this%ibound(igwfnode) /= 0) cycle
+        qbnd = this%flowbudptr%budterm(this%idxbudgwf)%flow(j)
+        if (qbnd < DZERO) then
+          call this%fmi%route_apt_final(n, igwfnode, -qbnd, &
+                                        -qbnd * this%eqnsclfac * this%xnewpak(n))
+        end if
+      end do
+    end if
     !
     ! -- calculate storage term
     do n = 1, this%ncv

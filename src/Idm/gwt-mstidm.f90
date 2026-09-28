@@ -22,6 +22,8 @@ module GwtMstInputModule
     logical :: sorbatefile = .false.
     logical :: export_ascii = .false.
     logical :: export_nc = .false.
+    logical :: drycellinact = .false.
+    logical :: drycellroute = .false.
     logical :: porosity = .false.
     logical :: decay = .false.
     logical :: decay_sorbed = .false.
@@ -229,6 +231,44 @@ module GwtMstInputModule
     )
 
   type(InputParamDefinitionType), parameter :: &
+    gwtmst_drycellinact = InputParamDefinitionType &
+    ( &
+    'GWT', & ! component
+    'MST', & ! subcomponent
+    'OPTIONS', & ! block
+    'DRY_CELL_ZERO_SAT_INACTIVE', & ! tag name
+    'DRYCELLINACT', & ! fortran variable
+    'KEYWORD', & ! type
+    '', & ! shape
+    'deactivate transport in zero-saturation cells', & ! longname
+    .false., & ! required
+    .false., & ! developmode
+    .false., & ! multi-record
+    .false., & ! preserve case
+    .false., & ! layered
+    .false. & ! timeseries
+    )
+
+  type(InputParamDefinitionType), parameter :: &
+    gwtmst_drycellroute = InputParamDefinitionType &
+    ( &
+    'GWT', & ! component
+    'MST', & ! subcomponent
+    'OPTIONS', & ! block
+    'DRY_CELL_ROUTE_MASS', & ! tag name
+    'DRYCELLROUTE', & ! fortran variable
+    'KEYWORD', & ! type
+    '', & ! shape
+    'route advected mass through E-inactive cells', & ! longname
+    .false., & ! required
+    .false., & ! developmode
+    .false., & ! multi-record
+    .false., & ! preserve case
+    .false., & ! layered
+    .false. & ! timeseries
+    )
+
+  type(InputParamDefinitionType), parameter :: &
     gwtmst_porosity = InputParamDefinitionType &
     ( &
     'GWT', & ! component
@@ -355,6 +395,8 @@ module GwtMstInputModule
     gwtmst_sorbatefile, &
     gwtmst_export_ascii, &
     gwtmst_export_nc, &
+    gwtmst_drycellinact, &
+    gwtmst_drycellroute, &
     gwtmst_porosity, &
     gwtmst_decay, &
     gwtmst_decay_sorbed, &

@@ -27,8 +27,8 @@
 module GwtUztModule
 
   use KindModule, only: DP, I4B
-  use ConstantsModule, only: DZERO, DONE, LINELENGTH
-  use SimModule, only: store_error
+  use ConstantsModule, only: DZERO, DONE, DEP20, LINELENGTH, LENBOUNDNAME
+  use SimModule, only: store_error, count_errors
   use BndModule, only: BndType, GetBndFromList
   use TspFmiModule, only: TspFmiType
   use UzfModule, only: UzfType
@@ -36,6 +36,8 @@ module GwtUztModule
   use TspAptModule, only: TspAptType, apt_process_obsID, &
                           apt_process_obsID12
   use MatrixBaseModule
+  use IsothermEnumModule, only: SORPTION_OFF, SORPTION_LINEAR, &
+                                SORPTION_FREUND, SORPTION_LANG
   implicit none
 
   public uzt_create
@@ -52,6 +54,36 @@ module GwtUztModule
     integer(I4B), pointer :: idxbudritm => null() ! index of rej infil to mover rate to mover terms in flowbudptr
     real(DP), dimension(:), pointer, contiguous :: concinfl => null() ! infiltration concentration
     real(DP), dimension(:), pointer, contiguous :: concuzet => null() ! unsat et concentration
+    !
+    ! -- solid-phase + air-water interfacial (AWI) sorption in the unsaturated zone.
+    !    R = 1 + bulk_density*distcoef/theta + (a_aw/theta)*kaw,
+    !    a_aw = 6*(1-por)*(1-sw)/d50, sw = theta/por -- the same expression
+    !    publication/pfas-vadose-end-members/research/figures/decision_surface_uncertainty.py:63
+    !    uses analytically. Units are NOT converted anywhere in this code (verified against
+    !    gwt-mst.f90's isrb/bulk_density/distcoef, which multiplies them raw with no scaling
+    !    constant) -- pick ONE consistent system when supplying these and say so in the dfn.
+    integer(I4B), pointer :: isrb => null() ! sorption flag: 0 off, 1 linear, 2 freundlich, 3 langmuir
+    integer(I4B), pointer :: iawisrb => null() ! AWI sorption flag: 0 off, 1 on
+    real(DP), dimension(:), pointer, contiguous :: bulk_density => null() ! solid bulk density, per feature
+    real(DP), dimension(:), pointer, contiguous :: distcoef => null() ! Kd distribution coefficient, per feature
+    real(DP), dimension(:), pointer, contiguous :: sp2 => null() ! 2nd isotherm param (freundlich exponent / langmuir sorption max), per feature
+    real(DP), dimension(:), pointer, contiguous :: por => null() ! total porosity, per feature (needed for theta/por = Sw)
+    real(DP), dimension(:), pointer, contiguous :: kaw => null() ! air-water interfacial partition coefficient, per feature
+    real(DP), dimension(:), pointer, contiguous :: d50 => null() ! median grain diameter, per feature
+    ! Residual water content. apt_get_volumes returns the MOBILE water volume -- gwf-uzf.f90
+    ! :3014 computes it as thick*(wcnew - thtr)*area and its own comment says "mobile water
+    ! volume". So theta_mobile = v/vcell and theta_TOTAL = theta_mobile + thtr. Sorption
+    ! equilibrates with all aqueous water touching the grains, not only the mobile fraction,
+    ! and total theta is also what MT3D-USGS eq. 24 uses -- so the default divides by TOTAL
+    ! theta and this input is what makes that conversion explicit rather than inherited.
+    real(DP), dimension(:), pointer, contiguous :: thtr => null()
+    ! GWF cell volume per UZT feature, so theta = water_volume / cell_volume. Filled once from
+    ! the GWF budget term (id1 = feature, id2 = gwf node) the first time it is needed.
+    real(DP), dimension(:), pointer, contiguous :: cellvol => null()
+    ! (patch 0006): GWF node per UZT feature, filled by the same walk as cellvol, so the
+    ! GWF saturation of that node (fmi%gwfsat) can bound the sorbing solid to the UNSATURATED
+    ! part of the cell. MST sorbs vcell*gwfsat (gwt-mst.f90:355-377); UZT sorbs the complement.
+    integer(I4B), dimension(:), pointer, contiguous :: cellnode => null()
 
   contains
 
@@ -73,6 +105,13 @@ module GwtUztModule
     procedure :: pak_bd_obs => uzt_bd_obs
     procedure :: pak_set_stressperiod => uzt_set_stressperiod
     procedure :: get_mvr_depvar
+    procedure :: bnd_options => uzt_options
+    procedure :: apt_read_cvs => uzt_read_cvs
+    procedure :: apt_stor_term => uzt_stor_term
+    procedure :: uzt_sorbed_vol
+    procedure :: uzt_capacity
+    procedure :: uzt_retardation
+    procedure :: uzt_cellvol
 
   end type GwtUztType
 
@@ -544,12 +583,16 @@ contains
     call mem_allocate(this%idxbudrinf, 'IDXBUDRINF', this%memoryPath)
     call mem_allocate(this%idxbuduzet, 'IDXBUDUZET', this%memoryPath)
     call mem_allocate(this%idxbudritm, 'IDXBUDRITM', this%memoryPath)
+    call mem_allocate(this%isrb, 'ISRB', this%memoryPath)
+    call mem_allocate(this%iawisrb, 'IAWISRB', this%memoryPath)
     !
     ! -- Initialize
     this%idxbudinfl = 0
     this%idxbudrinf = 0
     this%idxbuduzet = 0
     this%idxbudritm = 0
+    this%isrb = SORPTION_OFF
+    this%iawisrb = 0
   end subroutine allocate_scalars
 
   !> @brief Allocate arrays for package
@@ -594,14 +637,556 @@ contains
     call mem_deallocate(this%idxbudrinf)
     call mem_deallocate(this%idxbuduzet)
     call mem_deallocate(this%idxbudritm)
+    call mem_deallocate(this%isrb)
+    call mem_deallocate(this%iawisrb)
     !
     ! -- deallocate time series
     call mem_deallocate(this%concinfl)
     call mem_deallocate(this%concuzet)
     !
+    ! -- deallocate sorption arrays (allocated in uzt_read_cvs, sized this%ncv)
+    call mem_deallocate(this%bulk_density)
+    call mem_deallocate(this%distcoef)
+    call mem_deallocate(this%sp2)
+    call mem_deallocate(this%por)
+    call mem_deallocate(this%kaw)
+    call mem_deallocate(this%d50)
+    call mem_deallocate(this%thtr)
+    call mem_deallocate(this%cellvol)
+    call mem_deallocate(this%cellnode)
+    !
     ! -- deallocate scalars in TspAptType
     call this%TspAptType%bnd_da()
   end subroutine uzt_da
+
+  !> @brief UZT-specific options -- solid-phase SORPTION type and AWI_SORPTION toggle.
+  !!
+  !! Delegates anything it does not recognize to TspAptType%apt_options (the shared
+  !! advanced-package options: FLOW_PACKAGE_NAME, PRINT_CONCENTRATION, BUDGET, etc.).
+  !<
+  subroutine uzt_options(this, option, found)
+    ! -- dummy
+    class(GwtUztType), intent(inout) :: this
+    character(len=*), intent(inout) :: option
+    logical, intent(inout) :: found
+    ! -- local
+    character(len=LINELENGTH) :: keyword
+    character(len=LINELENGTH) :: errmsg
+    !
+    select case (option)
+    case ('SORPTION')
+      call this%parser%GetStringCaps(keyword)
+      select case (keyword)
+      case ('LINEAR')
+        this%isrb = SORPTION_LINEAR
+      case ('FREUNDLICH')
+        this%isrb = SORPTION_FREUND
+      case ('LANGMUIR')
+        this%isrb = SORPTION_LANG
+      case default
+        write (errmsg, '(a,1x,a)') &
+          'Unknown UZT SORPTION type, must be LINEAR, FREUNDLICH or &
+          &LANGMUIR:', trim(keyword)
+        call store_error(errmsg)
+      end select
+      write (this%iout, '(4x,a,1x,a)') &
+        'UZT SOLID-PHASE SORPTION IS ACTIVE, TYPE:', trim(keyword)
+      found = .true.
+    case ('AWI_SORPTION')
+      this%iawisrb = 1
+      write (this%iout, '(4x,a)') &
+        'UZT AIR-WATER INTERFACIAL (AWI) SORPTION IS ACTIVE.'
+      found = .true.
+    case default
+      ! -- delegate to the shared advanced-package options
+      call this%TspAptType%bnd_options(option, found)
+    end select
+  end subroutine uzt_options
+
+  !> @brief GWF cell volume for one UZT feature, cached.
+  !!
+  !! theta = water volume / CELL volume, so the storage-term override needs the cell volume
+  !! and not the water volume it is handed. The mapping feature -> GWF node lives in the GWF
+  !! budget term (id1 = feature, id2 = node), and the volume is area*(top-bot), the same form
+  !! gwt-mst.f90 uses. Walked once per feature and cached; the budget list does not move.
+  !<
+  function uzt_cellvol(this, n) result(vcell)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    ! -- local
+    real(DP) :: vcell
+    integer(I4B) :: i, ifeat, node
+    !
+    vcell = DZERO
+    if (n < 1 .or. n > this%ncv) return
+    if (this%cellvol(n) > DZERO) then
+      vcell = this%cellvol(n)
+      return
+    end if
+    if (this%idxbudgwf == 0) return
+    do i = 1, this%flowbudptr%budterm(this%idxbudgwf)%nlist
+      ifeat = this%flowbudptr%budterm(this%idxbudgwf)%id1(i)
+      node = this%flowbudptr%budterm(this%idxbudgwf)%id2(i)
+      if (ifeat < 1 .or. ifeat > this%ncv) cycle
+      if (node < 1) cycle
+      this%cellvol(ifeat) = this%dis%area(node) * &
+                            (this%dis%top(node) - this%dis%bot(node))
+      this%cellnode(ifeat) = node
+    end do
+    vcell = this%cellvol(n)
+  end function uzt_cellvol
+
+  !> @brief retardation factor for one UZT feature at the current water content.
+  !!
+  !! R = 1 + rhob*Kd/theta_m + (a_aw/theta_m)*Kaw, a_aw = 6*(1-por)*(1-Sw)/d50, Sw = theta_t/por.
+  !!
+  !! TWO WATER CONTENTS, AND THEY ARE NOT INTERCHANGEABLE -- this is the water-content repair and
+  !! the reason a blind revert of 8fadf65 was refused:
+  !!
+  !!   theta_m (MOBILE, v/Vcell) is the PARTITIONING denominator. R is multiplied back by the
+  !!     MOBILE water volume in uzt_stor_term, so every /theta_m here cancels exactly and the
+  !!     stored solid-phase mass comes out rhob*Kd*Vcell*c -- INDEPENDENT of water content,
+  !!     which is the one thing sorbed mass on a grain surface must be. Put theta_t in this
+  !!     denominator (8fadf65 did) and the cancellation is partial: the sorbed term becomes
+  !!     rhob*Kd*Vcell*c*(theta_m/theta_t), 42% short at this project's column and -> 0 as the
+  !!     profile dries, i.e. a drier soil sorbing LESS. That was the defect.
+  !!
+  !!   theta_t (TOTAL, theta_m + thtr) is the SATURATION. Sw = theta_t/por is physical wetness,
+  !!     and residual water wets grains whether or not it drains, so a_aw must see it. Passing
+  !!     theta_m here (the pre-8fadf65 code did) reports the column drier than it is and
+  !!     OVERSTATES the air-water interfacial area. 8fadf65 was RIGHT about this half; it
+  !!     simply applied the correction to the partitioning denominator as well, where it does
+  !!     not belong. Repairing the mass by reverting wholesale would re-break the saturation --
+  !!     the same one-half-of-an-expression error in the opposite direction.
+  !!
+  !! The a_aw term cancels the same way: (a_aw/theta_m)*Kaw * theta_m*Vcell = a_aw*Kaw*Vcell,
+  !! also water-content independent, with a_aw itself carrying the theta_t dependence it should.
+  !!
+  !! decision_surface_uncertainty.py:63 uses a SINGLE theta for both roles, so it agrees with
+  !! this only at thtr = 0 and cannot arbitrate between them; the earlier "matches by
+  !! construction" claim in this docstring was therefore too strong and is withdrawn.
+  !!
+  !! LINEAR sorption only -- FREUNDLICH/LANGMUIR are nonlinear (the isotherm slope depends on
+  !! concentration, so a single constant R cannot represent them the way MST's per-node
+  !! isotherm-derivative linearization does) and are refused with a loud error rather than
+  !! silently computing a wrong answer; that generalization is the next increment.
+  !! Both water contents are the CURRENT step's, so this is naturally per-timestep -- that is
+  !! MT3D-USGS eq. 24's "R updated for each transport time step" for free (a sizing argument
+  !! fact ii). vcell is carried for that sizing note and for future area-based terms; it is
+  !! not read here.
+  !<
+  function uzt_sorbed_vol(this, n, vcell, theta_t) result(vsorb)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    real(DP), intent(in) :: vcell !< SORBING solid volume: the UNSATURATED part of the GWF cell,
+                                  !! vcell*(1 - sat) (patch 0006); the saturated part is MST's
+    real(DP), intent(in) :: theta_t !< TOTAL water content of that unsaturated volume -- SATURATION ONLY, for A_aw
+    ! -- local
+    real(DP) :: vsorb
+    real(DP) :: a_aw, sw
+    character(len=LINELENGTH) :: errmsg
+    !
+    vsorb = DZERO
+    if (this%isrb == SORPTION_OFF .and. this%iawisrb == 0) return
+    if (vcell <= DZERO) return
+    !
+    select case (this%isrb)
+    case (SORPTION_OFF)
+      ! -- no solid-phase term
+    case (SORPTION_LINEAR)
+      ! rho_b*Kd*c is mass per BULK volume. No water content appears, and none is
+      ! introduced -- this is the whole content of the water-content repair.
+      vsorb = vsorb + this%bulk_density(n) * this%distcoef(n) * vcell
+    case default
+      write (errmsg, '(a)') &
+        'UZT SORPTION FREUNDLICH/LANGMUIR is not yet implemented (solid- &
+        &phase-linear + AWI increment only) -- use SORPTION LINEAR or contact &
+        &the engine seat before shipping a nonlinear UZT run.'
+      call store_error(errmsg)
+      call this%parser%StoreErrorUnit()
+    end select
+    !
+    if (this%iawisrb == 1) then
+      if (this%por(n) > DZERO .and. this%d50(n) > DZERO) then
+        ! S_w is PHYSICAL wetness, so it takes TOTAL theta: residual water wets grains
+        ! whether or not it drains, and an air-water interface does not care whether the
+        ! water on the far side of it is mobile. This half of 8fadf65 was RIGHT and is kept.
+        sw = theta_t / this%por(n)
+        a_aw = 6.0_DP * (DONE - this%por(n)) * (DONE - sw) / this%d50(n)
+        vsorb = vsorb + a_aw * this%kaw(n) * vcell
+      end if
+    end if
+  end function uzt_sorbed_vol
+
+  !> @brief (patch 0007): a feature's TOTAL storage capacity at one time level.
+  !!
+  !! vwat + the sorbed volume-equivalent over the unsaturated solid, computed EXACTLY as
+  !! uzt_stor_term computes it -- this function is the single source both use, so the storage
+  !! term and the rejected-infiltration branch cannot drift apart. `satval` is the GWF cell
+  !! saturation AT THAT LEVEL (gwfsat for the new level, gwfsatold for the old); a feature with
+  !! no GWF cell passes DZERO, which reproduces the vu = vcell case.
+  !!
+  !! It returns 0 exactly when the feature has neither mobile water nor sorbent -- the condition
+  !! patch 0007 branches on.
+  !<
+  function uzt_capacity(this, n, vwat, satval) result(vtot)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    real(DP), intent(in) :: vwat
+    real(DP), intent(in) :: satval
+    ! -- return
+    real(DP) :: vtot
+    ! -- local
+    real(DP) :: vcell
+    real(DP) :: vu
+    !
+    ! The commentary below travelled here from uzt_stor_term when patch 0007 made this the single
+    ! source; it is the record of two defects already paid for and must not be lost to a refactor.
+    !
+    ! theta = WATER volume / CELL volume. vwat is a water volume, so the denominator must be the
+    ! GWF cell volume. An earlier version used max(v0,v1) here, which made theta identically ~1.0:
+    ! the AWI area term then saw Sw = theta/por = 2.5 > 1, flipped sign, and SPED transport up.
+    ! Measured 2.5720 and 1.5110 against the 2.600 and 1.520 that theta=1 predicts -- the
+    ! acceptance matrix caught it and the pre-registered numbers identified it.
+    vtot = vwat
+    if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
+      ! vwat is a MOBILE water volume (gwf-uzf.f90:3014 subtracts thtr and says so in its own
+      ! comment). It is left ALONE: the sorbed volume-equivalent is ADDED to it, never multiplied
+      ! into it. thtr enters only through theta_t, and only as the SATURATION argument that A_aw
+      ! needs -- it is absent from the solid-phase mass.
+      ! (patch 0006): sorb over the UNSATURATED solid only. vcell*(1 - sat) is the exact
+      ! complement of MST's vcell*sat (gwt-mst.f90:355-377), with the same new/old pair MST uses
+      ! (gwfsat for the new level, gwfsatold for the old), so each grain is counted once.
+      ! gwfsatold is not clipped by stock (tsp-fmi.f90:503-523), so satval is clipped to [0,1]
+      ! here. sat = 0 gives vu = vcell*1.0 = vcell bit-exactly (c815ce2's value); sat = 1 gives
+      ! vu = 0 and stock UZT storage. theta_t is the wetness of that UNSATURATED volume
+      ! (vwat/vu + thtr): c815ce2 divided by the full vcell, which understated Sw and overstated
+      ! A_aw wherever the water table sat inside the cell.
+      vcell = this%uzt_cellvol(n)
+      if (vcell > DZERO) then
+        vu = vcell * (DONE - min(DONE, max(DZERO, satval)))
+        if (vu > DZERO) then
+          vtot = vtot + this%uzt_sorbed_vol(n, vu, vwat / vu + this%thtr(n))
+        end if
+      end if
+    end if
+  end function uzt_capacity
+
+  !> @brief retardation factor, DERIVED from the theta-free sorbed volume. DIAGNOSTIC.
+  !!
+  !! R = 1 + V_sorb/V_water, which is identically 1 + rhob*Kd/theta + (A_aw/theta)*Kaw for
+  !! whichever theta the caller's water volume expresses. Reported, never multiplied: the
+  !! storage term uses uzt_sorbed_vol directly. Returns 1 when there is no water to
+  !! partition against, since R is undefined there and the MASS is not -- which is exactly
+  !! why R is no longer the primitive.
+  !<
+  function uzt_retardation(this, n, vcell, vwater, theta_t) result(r)
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: n
+    real(DP), intent(in) :: vcell !< SORBING (unsaturated) solid volume, as uzt_sorbed_vol takes it
+    real(DP), intent(in) :: vwater !< water volume R is expressed against
+    real(DP), intent(in) :: theta_t !< TOTAL water content, for A_aw
+    ! -- local
+    real(DP) :: r
+    !
+    r = DONE
+    if (vwater > DZERO) then
+      r = r + this%uzt_sorbed_vol(n, vcell, theta_t) / vwater
+    end if
+  end function uzt_retardation
+
+  !> @brief UZT storage term, overriding TspAptType%apt_stor_term to ADD the sorbed
+  !! volume-equivalent to the stored water volume. THETA-FREE BY CONSTRUCTION:
+  !!
+  !!   v_eff = v_water + (rhob*Kd + A_aw*Kaw) * Vcell
+  !!
+  !! aqueous on the MOBILE water apt_get_volumes hands us (stock MF6 UZT's transport model,
+  !! unchanged by this patch) plus sorbed terms that contain NO water content at all.
+  !!
+  !! WHY NOT R. The earlier form multiplied v by a retardation factor, and that is how
+  !! the defect happened: FORMING R REQUIRES CHOOSING A THETA FOR THE DENOMINATOR, AND
+  !! MULTIPLYING R BY A VOLUME REQUIRES THE SAME THETA. 8fadf65 changed the first choice and
+  !! not the second, so the cancellation went partial and the sorbed term came out
+  !! rhob*Kd*Vcell*(theta_m/theta_t) -- 42% low here, and -> 0 as the profile dries, a drier
+  !! soil sorbing less. Written theta-free the mass is correct under EVERY water convention
+  !! and the question that caused the defect cannot be asked. (it
+  !! supersedes the R-on-mobile-theta repair this seat implemented first, which was
+  !! numerically equal and structurally worse.)
+  !!
+  !! AND IT REMOVES A DIVISION NOBODY HAD FLAGGED: R = 1 + rhob*Kd/theta diverges as a cell
+  !! dries and v_water = 0 divides by zero exactly. The R form's theta > 0 guard does not
+  !! rescue it -- it yields v_eff = 0, i.e. a singular row carrying NO sorbed storage, when
+  !! the right answer at zero mobile water is still rhob*Kd*Vcell. The theta-free form has
+  !! no division and is well-posed at theta_m = 0.
+  !!
+  !! Each step gets its own v_sorb, so eq. 24's time-varying R still falls out of the
+  !! existing structure through A_aw's saturation dependence (
+  !! verified against tsp-apt.f90:2256). With isrb=OFF and iawisrb=0 the block is skipped
+  !! entirely, v is untouched, and this is byte-identical to the inherited apt_stor_term --
+  !! that identity IS acceptance test (b)'s control.
+  !!
+  !! ACCEPTANCE IS A MASS, NOT A RATIO, and that is the night's lesson rather than a
+  !! preference: THREE ratio instruments were blind to this defect -- section 4 row 3 (14.75
+  !! on both builds), the 8/8 acceptance matrix, and the sorbed/aqueous budget ratio
+  !! (13.7615 defective against MT3D's 13.7615, identical to 1.78e-15) -- because the defect
+  !! enters as a COMMON FACTOR and every ratio divides it out. The sorbed term itself sees
+  !! it: 1.6500 correct against 0.9619 at theta_m 0.0699, 0.1500 at 0.0050, 0.0163 at
+  !! 0.0005. Two points minimum; the fall toward zero on drying is the signature.
+  !!
+  !! This docstring previously read "theta = v1/vcell" while the body computed v/vcell+thtr.
+  !! The docstring was right and the code was wrong; neither quantity is used that way now.
+  !!
+  !! MASS BALANCE (work item 3): this function's rrate becomes this%qsto(n), the package's
+  !! STORAGE budget term (tsp-apt.f90:942-947) -- so adding v_sorb here makes STORAGE report
+  !! water+sorbed mass together automatically. No separate sorbed-mass budget term is needed;
+  !! confirmed by reading how qsto is filled before writing this, not assumed.
+  !<
+  subroutine uzt_stor_term(this, ientry, n1, n2, rrate, rhsval, hcofval)
+    use TdisModule, only: delt
+    ! -- dummy
+    class(GwtUztType) :: this
+    integer(I4B), intent(in) :: ientry
+    integer(I4B), intent(inout) :: n1
+    integer(I4B), intent(inout) :: n2
+    real(DP), intent(inout), optional :: rrate
+    real(DP), intent(inout), optional :: rhsval
+    real(DP), intent(inout), optional :: hcofval
+    ! -- local
+    real(DP) :: v0, v1
+    real(DP) :: c0, c1
+    real(DP) :: sat0, sat1
+    integer(I4B) :: node
+    !
+    n1 = ientry
+    n2 = ientry
+    call this%apt_get_volumes(n1, v1, v0, delt)
+    c0 = this%xoldpak(n1)
+    c1 = this%xnewpak(n1)
+    !
+    ! (patch 0007): the capacity formula now lives in uzt_capacity and is called from BOTH
+    ! here and uzt_rinf_term/uzt_ritm_term, so the diagonal the storage term builds and the
+    ! condition the rejection branch tests can never disagree. The arithmetic is unchanged from
+    ! 0006: v = v_water + sorbed volume-equivalent over the UNSATURATED solid vcell*(1 - sat),
+    ! the exact complement of MST's vcell*sat, with gwfsatold for the old level and gwfsat for the
+    ! new, both clipped to [0,1] because stock does not clip gwfsatold (tsp-fmi.f90:503-523).
+    node = this%cellnode(n1)
+    sat0 = DZERO
+    sat1 = DZERO
+    if (node > 0) then
+      sat0 = this%fmi%gwfsatold(node, delt)
+      sat1 = this%fmi%gwfsat(node)
+    end if
+    v0 = this%uzt_capacity(n1, v0, sat0)
+    v1 = this%uzt_capacity(n1, v1, sat1)
+    !
+    if (present(rrate)) then
+      rrate = (-c1 * v1 / delt + c0 * v0 / delt) * this%eqnsclfac
+    end if
+    if (present(rhsval)) rhsval = -c0 * v0 * this%eqnsclfac / delt
+    if (present(hcofval)) hcofval = -v1 * this%eqnsclfac / delt
+  end subroutine uzt_stor_term
+
+  !> @brief UZT PACKAGEDATA reader, extended with per-feature sorption parameters.
+  !!
+  !! Copy of TspAptType%apt_read_cvs (tsp-apt.f90:1470) with six new columns inserted
+  !! between STRT and AUX -- BULK_DENSITY, DISTCOEF, SP2, POR, KAW, D50 -- matching the
+  !! precedent already in this codebase: gwe-lke.f90's lke_read_cvs inserts its own
+  !! package-specific KTF/RFEATTHK in exactly this position, unconditionally present on
+  !! every line regardless of any options flag (the values are simply unused if SORPTION
+  !! and AWI_SORPTION are both off, same as LKE's thermal terms when conduction is unused).
+  !<
+  subroutine uzt_read_cvs(this)
+    ! -- modules
+    use MemoryManagerModule, only: mem_allocate
+    use TimeSeriesManagerModule, only: read_value_or_time_series_adv
+    ! -- dummy
+    class(GwtUztType), intent(inout) :: this
+    ! -- local
+    character(len=LINELENGTH) :: text
+    character(len=LINELENGTH) :: errmsg
+    character(len=LENBOUNDNAME) :: bndName, bndNameTemp
+    character(len=9) :: cno
+    character(len=50), dimension(:), allocatable :: caux
+    integer(I4B) :: ierr
+    logical :: isfound, endOfBlock
+    integer(I4B) :: n
+    integer(I4B) :: ii, jj
+    integer(I4B) :: iaux
+    integer(I4B) :: itmp
+    integer(I4B) :: nlak
+    integer(I4B) :: nconn
+    integer(I4B), dimension(:), pointer, contiguous :: nboundchk
+    real(DP), pointer :: bndElem => null()
+    !
+    itmp = 0
+    !
+    call mem_allocate(this%strt, this%ncv, 'STRT', this%memoryPath)
+    call mem_allocate(this%lauxvar, this%naux, this%ncv, 'LAUXVAR', &
+                      this%memoryPath)
+    call mem_allocate(this%bulk_density, this%ncv, 'BULK_DENSITY', this%memoryPath)
+    call mem_allocate(this%distcoef, this%ncv, 'DISTCOEF', this%memoryPath)
+    call mem_allocate(this%sp2, this%ncv, 'SP2', this%memoryPath)
+    call mem_allocate(this%por, this%ncv, 'POR', this%memoryPath)
+    call mem_allocate(this%kaw, this%ncv, 'KAW', this%memoryPath)
+    call mem_allocate(this%d50, this%ncv, 'D50', this%memoryPath)
+    call mem_allocate(this%thtr, this%ncv, 'THTR', this%memoryPath)
+    call mem_allocate(this%cellvol, this%ncv, 'CELLVOL', this%memoryPath)
+    call mem_allocate(this%cellnode, this%ncv, 'CELLNODE', this%memoryPath)
+    !
+    if (this%imatrows == 0) then
+      call mem_allocate(this%iboundpak, this%ncv, 'IBOUND', this%memoryPath)
+      call mem_allocate(this%xnewpak, this%ncv, 'XNEWPAK', this%memoryPath)
+    end if
+    call mem_allocate(this%xoldpak, this%ncv, 'XOLDPAK', this%memoryPath)
+    !
+    allocate (this%featname(this%ncv))
+    !
+    do n = 1, this%ncv
+      this%strt(n) = DEP20
+      this%lauxvar(:, n) = DZERO
+      this%xoldpak(n) = DEP20
+      this%bulk_density(n) = DZERO
+      this%distcoef(n) = DZERO
+      this%sp2(n) = DZERO
+      this%por(n) = DZERO
+      this%kaw(n) = DZERO
+      this%d50(n) = DZERO
+      this%thtr(n) = DZERO
+      this%cellvol(n) = DZERO
+      this%cellnode(n) = 0
+      if (this%imatrows == 0) then
+        this%iboundpak(n) = 1
+        this%xnewpak(n) = DEP20
+      end if
+    end do
+    !
+    if (this%naux > 0) then
+      allocate (caux(this%naux))
+    end if
+    !
+    allocate (nboundchk(this%ncv))
+    do n = 1, this%ncv
+      nboundchk(n) = 0
+    end do
+    !
+    call this%parser%GetBlock('PACKAGEDATA', isfound, ierr, &
+                              supportOpenClose=.true.)
+    !
+    if (isfound) then
+      write (this%iout, '(/1x,a)') 'PROCESSING '//trim(adjustl(this%text))// &
+        ' PACKAGEDATA'
+      nlak = 0
+      nconn = 0
+      do
+        call this%parser%GetNextLine(endOfBlock)
+        if (endOfBlock) exit
+        n = this%parser%GetInteger()
+
+        if (n < 1 .or. n > this%ncv) then
+          write (errmsg, '(a,1x,i6)') &
+            'Itemno must be > 0 and <= ', this%ncv
+          call store_error(errmsg)
+          cycle
+        end if
+        !
+        nboundchk(n) = nboundchk(n) + 1
+        !
+        ! -- strt
+        this%strt(n) = this%parser%GetDouble()
+        !
+        ! -- sorption parameters, read ONLY when the matching option is active.
+        !    gwe-lke.f90 reads its KTF/RFEATTHK unconditionally, but LKE could afford that
+        !    -- UZT cannot. UZT is a RELEASED package with existing input files, including
+        !    the eight site models behind our own CONHYD submission (the build scripts
+        !    under publication/pfas-vadose-end-members/research/site_models). Mandatory new
+        !    columns would make every one of them unreadable by this binary, i.e. would
+        !    break the reproducibility artifacts of the very paper this feature answers.
+        !    Conditional reading also makes "no SORPTION keyword" byte-identical to the
+        !    unpatched binary, which is the control acceptance tests (b) and (e) rest on.
+        if (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1) then
+          this%por(n) = this%parser%GetDouble()
+          this%thtr(n) = this%parser%GetDouble()
+        end if
+        if (this%isrb /= SORPTION_OFF) then
+          this%bulk_density(n) = this%parser%GetDouble()
+          this%distcoef(n) = this%parser%GetDouble()
+          this%sp2(n) = this%parser%GetDouble()
+        end if
+        if (this%iawisrb == 1) then
+          this%kaw(n) = this%parser%GetDouble()
+          this%d50(n) = this%parser%GetDouble()
+        end if
+        if (this%isrb /= SORPTION_OFF .and. this%por(n) <= DZERO) then
+          write (errmsg, '(a,1x,i0)') &
+            'POR must be > 0 when SORPTION is active, feature', n
+          call store_error(errmsg)
+        end if
+        if (this%iawisrb == 1 .and. (this%por(n) <= DZERO .or. this%d50(n) <= DZERO)) then
+          write (errmsg, '(a,1x,i0)') &
+            'POR and D50 must both be > 0 when AWI_SORPTION is active, feature', n
+          call store_error(errmsg)
+        end if
+        !
+        ! -- get aux data
+        do iaux = 1, this%naux
+          call this%parser%GetString(caux(iaux))
+        end do
+
+        write (cno, '(i9.9)') n
+        bndName = 'Feature'//cno
+
+        if (this%inamedbound /= 0) then
+          call this%parser%GetStringCaps(bndNameTemp)
+          if (bndNameTemp /= '') then
+            bndName = bndNameTemp
+          end if
+        end if
+        this%featname(n) = bndName
+
+        do jj = 1, this%naux
+          text = caux(jj)
+          ii = n
+          bndElem => this%lauxvar(jj, ii)
+          call read_value_or_time_series_adv(text, ii, jj, bndElem, &
+                                             this%packName, 'AUX', &
+                                             this%tsManager, this%iprpak, &
+                                             this%auxname(jj))
+        end do
+        !
+        nlak = nlak + 1
+      end do
+      !
+      do n = 1, this%ncv
+        if (nboundchk(n) == 0) then
+          write (errmsg, '(a,1x,i0)') 'No data specified for feature', n
+          call store_error(errmsg)
+        else if (nboundchk(n) > 1) then
+          write (errmsg, '(a,1x,i0,1x,a,1x,i0,1x,a)') &
+            'Data for feature', n, 'specified', nboundchk(n), 'times'
+          call store_error(errmsg)
+        end if
+      end do
+      !
+      write (this%iout, '(1x,a)') &
+        'END OF '//trim(adjustl(this%text))//' PACKAGEDATA'
+    else
+      call store_error('Required packagedata block not found.')
+    end if
+    !
+    if (count_errors() > 0) then
+      call this%parser%StoreErrorUnit()
+    end if
+    !
+    if (this%naux > 0) then
+      deallocate (caux)
+    end if
+    !
+    deallocate (nboundchk)
+  end subroutine uzt_read_cvs
 
   !> @brief Infiltration term
   !!
@@ -650,6 +1235,7 @@ contains
   !<
   subroutine uzt_rinf_term(this, ientry, n1, n2, rrate, &
                            rhsval, hcofval)
+    use TdisModule, only: delt
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: ientry
@@ -661,14 +1247,61 @@ contains
     ! -- local
     real(DP) :: qbnd
     real(DP) :: ctmp
+    real(DP) :: v0, v1
+    real(DP) :: sat1
+    real(DP) :: cap
+    integer(I4B) :: node
     !
     n1 = this%flowbudptr%budterm(this%idxbudrinf)%id1(ientry)
     n2 = this%flowbudptr%budterm(this%idxbudrinf)%id2(ientry)
     qbnd = this%flowbudptr%budterm(this%idxbudrinf)%flow(ientry)
     ctmp = this%concinfl(n1)
-    if (present(rrate)) rrate = ctmp * qbnd
-    if (present(rhsval)) rhsval = DZERO
-    if (present(hcofval)) hcofval = qbnd
+    !
+    ! -- (patch 0007). The rejected portion of the infiltration never entered the soil, so it
+    !    leaves at the INFILTRATION concentration -- what this routine's own header has always
+    !    said, and what its rrate has always printed. Stock handed the MATRIX hcofval = qbnd,
+    !    which removes at the FEATURE concentration instead, so the printed rate and the rate the
+    !    matrix implies (hcof*c1 - rhs) disagreed whenever c1 /= concinfl. The corrected form is
+    !    the same construction uzt_infl_term uses for its own inflow-concentration branch: the
+    !    whole term goes to RHS and the diagonal is untouched.
+    !
+    !    AT ZERO CAPACITY THE STOCK CONVENTION IS RETAINED, DELIBERATELY. With no mobile water and
+    !    no sorbent the feature stores nothing, the mass balance is satisfied for ANY c1, and the
+    !    two forms disagree only about how to NAME an undefined concentration -- not about mass.
+    !    Stock resolves that indeterminacy as c1 = concinfl; the corrected form would leave the row
+    !    with a ZERO DIAGONAL, and tsp-apt.f90 divides by it unguarded when the features are solved
+    !    explicitly. Measured on the Rogue 250 m deck: 399 features are dry-and-rejecting at some
+    !    step and 320 at one step, so this is the common case, not a corner. Applying the
+    !    correction only where capacity > 0 puts it exactly where the solver was wrongly retaining
+    !    mass and changes nothing where there is no mass to retain.
+    call this%apt_get_volumes(n1, v1, v0, delt)
+    node = this%cellnode(n1)
+    sat1 = DZERO
+    if (node > 0) sat1 = this%fmi%gwfsat(node)
+    cap = this%uzt_capacity(n1, v1, sat1)
+    !
+    if (cap > DZERO) then
+      if (present(rrate)) rrate = ctmp * qbnd
+      if (present(rhsval)) rhsval = -qbnd * ctmp
+      if (present(hcofval)) hcofval = DZERO
+    else
+      ! -- (patch 0008). On this branch the matrix removes at the FEATURE concentration
+      !    (hcofval = qbnd), so the rate it implies is qbnd*c1, and the print must say the same
+      !    thing or the budget cannot close -- the invariant rrate == hcof*c1 - rhs that every
+      !    other term in this file satisfies. Printing ctmp*qbnd here (concinfl) was correct
+      !    only while c1 == concinfl, which holds when the row has no other term; a cell that
+      !    saturates during the step releases its old-level sorbed pool into this row
+      !    (rhs -c0*v0/delt) with zero capacity left to hold it, c1 rises above concinfl, and
+      !    the released mass leaves with the rejected water at c1. Nothing else is
+      !    arithmetically possible there: the diagonal is qbnd alone, and moving the term to
+      !    the right-hand side would give 0*c1 = release, which has no solution. So the
+      !    matrix is left exactly as it was and the print is made to tell the truth about it.
+      !    Same construction as uzt_infl_term's qbnd < 0 branch. Measured on the Rogue 250 m
+      !    deck: 5 (feature, step) pairs, one feature, 2.63481 mass units carried the mismatch.
+      if (present(rrate)) rrate = qbnd * this%xnewpak(n1)
+      if (present(rhsval)) rhsval = DZERO
+      if (present(hcofval)) hcofval = qbnd
+    end if
   end subroutine uzt_rinf_term
 
   !> @brief Evapotranspiration from the unsaturated-zone term
@@ -717,6 +1350,7 @@ contains
   !<
   subroutine uzt_ritm_term(this, ientry, n1, n2, rrate, &
                            rhsval, hcofval)
+    use TdisModule, only: delt
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: ientry
@@ -728,14 +1362,61 @@ contains
     ! -- local
     real(DP) :: qbnd
     real(DP) :: ctmp
+    real(DP) :: v0, v1
+    real(DP) :: sat1
+    real(DP) :: cap
+    integer(I4B) :: node
     !
     n1 = this%flowbudptr%budterm(this%idxbudritm)%id1(ientry)
     n2 = this%flowbudptr%budterm(this%idxbudritm)%id2(ientry)
     qbnd = this%flowbudptr%budterm(this%idxbudritm)%flow(ientry)
     ctmp = this%concinfl(n1)
-    if (present(rrate)) rrate = ctmp * qbnd
-    if (present(rhsval)) rhsval = DZERO
-    if (present(hcofval)) hcofval = qbnd
+    !
+    ! -- (patch 0007). The rejected portion of the infiltration never entered the soil, so it
+    !    leaves at the INFILTRATION concentration -- what this routine's own header has always
+    !    said, and what its rrate has always printed. Stock handed the MATRIX hcofval = qbnd,
+    !    which removes at the FEATURE concentration instead, so the printed rate and the rate the
+    !    matrix implies (hcof*c1 - rhs) disagreed whenever c1 /= concinfl. The corrected form is
+    !    the same construction uzt_infl_term uses for its own inflow-concentration branch: the
+    !    whole term goes to RHS and the diagonal is untouched.
+    !
+    !    AT ZERO CAPACITY THE STOCK CONVENTION IS RETAINED, DELIBERATELY. With no mobile water and
+    !    no sorbent the feature stores nothing, the mass balance is satisfied for ANY c1, and the
+    !    two forms disagree only about how to NAME an undefined concentration -- not about mass.
+    !    Stock resolves that indeterminacy as c1 = concinfl; the corrected form would leave the row
+    !    with a ZERO DIAGONAL, and tsp-apt.f90 divides by it unguarded when the features are solved
+    !    explicitly. Measured on the Rogue 250 m deck: 399 features are dry-and-rejecting at some
+    !    step and 320 at one step, so this is the common case, not a corner. Applying the
+    !    correction only where capacity > 0 puts it exactly where the solver was wrongly retaining
+    !    mass and changes nothing where there is no mass to retain.
+    call this%apt_get_volumes(n1, v1, v0, delt)
+    node = this%cellnode(n1)
+    sat1 = DZERO
+    if (node > 0) sat1 = this%fmi%gwfsat(node)
+    cap = this%uzt_capacity(n1, v1, sat1)
+    !
+    if (cap > DZERO) then
+      if (present(rrate)) rrate = ctmp * qbnd
+      if (present(rhsval)) rhsval = -qbnd * ctmp
+      if (present(hcofval)) hcofval = DZERO
+    else
+      ! -- (patch 0008). On this branch the matrix removes at the FEATURE concentration
+      !    (hcofval = qbnd), so the rate it implies is qbnd*c1, and the print must say the same
+      !    thing or the budget cannot close -- the invariant rrate == hcof*c1 - rhs that every
+      !    other term in this file satisfies. Printing ctmp*qbnd here (concinfl) was correct
+      !    only while c1 == concinfl, which holds when the row has no other term; a cell that
+      !    saturates during the step releases its old-level sorbed pool into this row
+      !    (rhs -c0*v0/delt) with zero capacity left to hold it, c1 rises above concinfl, and
+      !    the released mass leaves with the rejected water at c1. Nothing else is
+      !    arithmetically possible there: the diagonal is qbnd alone, and moving the term to
+      !    the right-hand side would give 0*c1 = release, which has no solution. So the
+      !    matrix is left exactly as it was and the print is made to tell the truth about it.
+      !    Same construction as uzt_infl_term's qbnd < 0 branch. Measured on the Rogue 250 m
+      !    deck: 5 (feature, step) pairs, one feature, 2.63481 mass units carried the mismatch.
+      if (present(rrate)) rrate = qbnd * this%xnewpak(n1)
+      if (present(rhsval)) rhsval = DZERO
+      if (present(hcofval)) hcofval = qbnd
+    end if
   end subroutine uzt_ritm_term
 
   !> @brief Define UZT Observation

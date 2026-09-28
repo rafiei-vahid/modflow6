@@ -27,10 +27,10 @@ module GwtMstModule
   public :: GwtMstType
   public :: mst_cr
   !
-  integer(I4B), parameter :: NBDITEMS = 4
+  integer(I4B), parameter :: NBDITEMS = 5
   character(len=LENBUDTXT), dimension(NBDITEMS) :: budtxt
   data budtxt/' STORAGE-AQUEOUS', '   DECAY-AQUEOUS', &
-    '  STORAGE-SORBED', '    DECAY-SORBED'/
+    '  STORAGE-SORBED', '    DECAY-SORBED', '        DRY-CELL'/
 
   !> @brief Enumerator that defines the decay options
   !<
@@ -75,6 +75,8 @@ module GwtMstModule
     ! -- misc
     integer(I4B), dimension(:), pointer, contiguous :: ibound => null() !< pointer to model ibound
     type(TspFmiType), pointer :: fmi => null() !< pointer to fmi object
+    integer(I4B) :: izerosat = 0 !< patch E (rafiei-vahid fork): 1 = DRY_CELL_ZERO_SAT_INACTIVE
+    real(DP), dimension(:), allocatable :: ratedry !< patch E: DRY-CELL mass rate per cell (negative = out of the domain)
 
   contains
 
@@ -487,6 +489,12 @@ contains
     real(DP), intent(in), dimension(nodes) :: cold !< concentration at end of last time step
     real(DP), dimension(:), contiguous, intent(inout) :: flowja !< flow between two connected control volumes
     !
+    ! -- patch E: reset the per-step DRY-CELL rates
+    if (this%izerosat /= 0) then
+      if (.not. allocated(this%ratedry)) allocate (this%ratedry(nodes))
+      this%ratedry(:) = DZERO
+    end if
+    !
     ! - storage
     call this%mst_cq_sto(nodes, cnew, cold, flowja)
     !
@@ -540,7 +548,21 @@ contains
       this%ratesto(n) = DZERO
       !
       ! -- skip if transport inactive
-      if (this%ibound(n) <= 0) cycle
+      if (this%ibound(n) <= 0) then
+        ! -- patch E: a cell deactivated THIS step releases the aqueous mass it held (vnew = 0 at zero
+        !    saturation, so vold is the storage-flow term alone); booked as STORAGE in and DRY-CELL out.
+        if (this%izerosat /= 0 .and. allocated(this%fmi%idrynew)) then
+          if (this%fmi%idrynew(n) == 1) then
+            vold = DZERO
+            if (this%fmi%igwfstrgss /= 0) vold = vold + this%fmi%gwfstrgss(n) * delt
+            if (this%fmi%igwfstrgsy /= 0) vold = vold + this%fmi%gwfstrgsy(n) * delt
+            rate = vold * tled * cold(n)
+            this%ratesto(n) = rate
+            this%ratedry(n) = this%ratedry(n) - rate
+          end if
+        end if
+        cycle
+      end if
       !
       ! -- calculate new and old water volumes
       vnew = this%dis%area(n) * (this%dis%top(n) - this%dis%bot(n)) * &
@@ -650,7 +672,21 @@ contains
       rate = 0.0_dp
       !
       ! -- skip if transport inactive
-      if (this%ibound(n) <= 0) cycle
+      if (this%ibound(n) <= 0) then
+        ! -- patch E: the sorbed mass a cell held when deactivated THIS step (sat_new = 0), released and booked
+        if (this%izerosat /= 0 .and. allocated(this%fmi%idrynew)) then
+          if (this%fmi%idrynew(n) == 1) then
+            Vcell = this%dis%area(n) * (this%dis%top(n) - this%dis%bot(n))
+            rhobm = this%bulk_density(n)
+            volfracm = this%get_volfracm(n)
+            sat_old = this%fmi%gwfsatold(n, delt)
+            rate = volfracm * rhobm * sat_old * this%isotherm%value(cold, n) * Vcell * tled
+            this%ratesrb(n) = rate
+            this%ratedry(n) = this%ratedry(n) - rate
+          end if
+        end if
+        cycle
+      end if
       !
       ! -- assign variables
       Vcell = this%dis%area(n) * (this%dis%top(n) - this%dis%bot(n))
@@ -818,6 +854,7 @@ contains
     ! -- local
     real(DP) :: rin
     real(DP) :: rout
+    integer(I4B) :: i
     !
     ! -- sto
     call rate_accumulator(this%ratesto, rin, rout)
@@ -842,6 +879,37 @@ contains
     if (this%isrb /= SORPTION_OFF .and. this%idcy /= DECAY_OFF) then
       call rate_accumulator(this%ratedcys, rin, rout)
       call model_budget%addentry(rin, rout, delt, budtxt(4), &
+                                 isuppress_output, rowlabel=this%packName)
+    end if
+    !
+    ! -- patch E: DRY-CELL (mass removed with cells deactivated at zero saturation)
+    if (this%izerosat /= 0) then
+      if (allocated(this%ratedry)) then
+        call rate_accumulator(this%ratedry, rin, rout)
+        call model_budget%addentry(rin, rout, delt, budtxt(5), &
+                                   isuppress_output, rowlabel=this%packName)
+      end if
+    end if
+    !
+    ! -- E v3: ROUTED (IN = deliveries at receivers, OUT = removals at senders; the net is the
+    !    advanced-package mass entering E-inactive cells less the sink shares). ROUTED-SINK and WITHHELD-ISOL are
+    !    diagnostic records only: adding them here would count that mass twice.
+    if (this%fmi%iroute /= 0) then
+      rin = DZERO
+      rout = DZERO
+      do i = 1, this%fmi%nro
+        if (this%fmi%roq(i) > DZERO) then
+          rin = rin + this%fmi%roq(i)
+        else
+          rout = rout - this%fmi%roq(i)
+        end if
+      end do
+      call model_budget%addentry(rin, rout, delt, '          ROUTED', &
+                                 isuppress_output, rowlabel=this%packName)
+      ! -- ROUTED-CNC: a constant-concentration cell supplies the routed mass it sends (IN) and takes the routed mass
+      !    delivered to it (OUT); the CNC package does not book faces to inactive neighbours (gwt-cnc.f90 cnc_cq,
+      !    ibound(n2) > 0), so without this entry the model budget would carry exactly that mass as a discrepancy
+      call model_budget%addentry(this%fmi%rcncin, this%fmi%rcncout, delt, '      ROUTED-CNC', &
                                  isuppress_output, rowlabel=this%packName)
     end if
   end subroutine mst_bd
@@ -898,8 +966,43 @@ contains
         call this%dis%record_array(this%ratedcys, this%iout, iprint, -ibinun, &
                                    budtxt(4), cdatafmp, nvaluesp, &
                                    nwidthp, editdesc, dinact)
+      !
+      ! -- E v3: ROUTED, ROUTED-SINK and WITHHELD-ISOL as lists (node = the GWT cell; id2 = 0 for a face
+      !    origin, else the advanced-package feature); written even when empty, so absent never means zero
+      if (this%fmi%iroute /= 0) then
+        call mst_route_list(this, '          ROUTED', this%fmi%nro, this%fmi%ronode, &
+                            this%fmi%roid2, this%fmi%roq, ibinun)
+        call mst_route_list(this, '     ROUTED-SINK', this%fmi%nrs, this%fmi%rsnode, &
+                            this%fmi%rsid2, this%fmi%rsq, ibinun)
+        call mst_route_list(this, '   WITHHELD-ISOL', this%fmi%nrw, this%fmi%rwnode, &
+                            this%fmi%rwid2, this%fmi%rwq, ibinun)
+      end if
     end if
   end subroutine mst_ot_flow
+
+  !> @brief E v3: write one routing list record to the model budget file
+  !<
+  subroutine mst_route_list(this, text, nlist, anode, aid2, aq, ibinun)
+    class(GwtMstType) :: this
+    character(len=16), intent(in) :: text
+    integer(I4B), intent(in) :: nlist
+    integer(I4B), dimension(:), allocatable, intent(in) :: anode
+    integer(I4B), dimension(:), allocatable, intent(in) :: aid2
+    real(DP), dimension(:), allocatable, intent(in) :: aq
+    integer(I4B), intent(in) :: ibinun
+    character(len=16), dimension(1) :: auxname
+    real(DP), dimension(1) :: auxrow
+    integer(I4B) :: i
+    auxname(1) = ''
+    auxrow(1) = DZERO
+    call this%dis%record_srcdst_list_header(text, this%name_model, this%name_model, &
+                                            this%name_model, this%packName, 0, &
+                                            auxname, ibinun, nlist, this%iout)
+    do i = 1, nlist
+      call this%dis%record_mf6_list_entry(ibinun, anode(i), aid2(i), aq(i), 0, &
+                                          auxrow, olconv2=.FALSE.)
+    end do
+  end subroutine mst_route_list
 
   !> @brief Save sorbate concentration array to binary file
   !<
@@ -1114,6 +1217,9 @@ contains
     character(len=LENVARNAME), dimension(3) :: sorption_method = &
       &[character(len=LENVARNAME) :: 'LINEAR', 'FREUNDLICH', 'LANGMUIR']
     character(len=LINELENGTH) :: fname
+    integer(I4B), target :: ikw
+    integer(I4B), target :: ikw2
+    integer(I4B), pointer :: pkw
     !
     ! -- update defaults with memory sourced values
     call mem_set_value(this%ipakcb, 'SAVE_FLOWS', this%input_mempath, &
@@ -1126,10 +1232,29 @@ contains
                        sorption_method, found%sorption)
     call mem_set_value(fname, 'SORBATEFILE', this%input_mempath, &
                        found%sorbatefile)
+    pkw => ikw
+    call mem_set_value(pkw, 'DRYCELLINACT', this%input_mempath, &
+                       found%drycellinact)
+    pkw => ikw2
+    call mem_set_value(pkw, 'DRYCELLROUTE', this%input_mempath, &
+                       found%drycellroute)
 
     ! -- found side effects
     if (found%save_flows) this%ipakcb = -1
     if (found%order1_decay) this%idcy = DECAY_FIRST_ORDER
+    if (found%drycellinact) then
+      this%izerosat = 1
+      this%fmi%izerosatinact = 1
+    end if
+    if (found%drycellroute) then
+      if (.not. found%drycellinact) then
+        call store_error('DRY_CELL_ROUTE_MASS requires DRY_CELL_ZERO_SAT_INACTIVE &
+                         &(rafiei-vahid fork).')
+        call store_error_filename(this%input_fname)
+      else
+        this%fmi%iroute = 1
+      end if
+    end if
     if (found%order0_decay) this%idcy = DECAY_ZERO_ORDER
     if (found%sorption) then
       if (this%isrb == IZERO) then
@@ -1177,6 +1302,15 @@ contains
       &'OPENED ON UNIT: ',I7)"
 
     write (this%iout, '(1x,a)') 'PROCESSING MOBILE STORAGE AND TRANSFER OPTIONS'
+    if (found%drycellinact) then
+      write (this%iout, '(4x,a)') 'DRY_CELL_ZERO_SAT_INACTIVE: a cell at zero flow saturation is INACTIVE for &
+        &transport; the mass it held when deactivated is booked as DRY-CELL (rafiei-vahid fork).'
+    end if
+    if (found%drycellroute) then
+      write (this%iout, '(4x,a)') 'DRY_CELL_ROUTE_MASS: mass advected into an E-inactive cell follows the water &
+        &through it, split over its outflows by flow share (first-order upwind), booked as ROUTED; ROUTED-SINK and &
+        &WITHHELD-ISOL are saved as diagnostic records (rafiei-vahid fork).'
+    end if
     if (found%save_flows) then
       write (this%iout, fmtisvflow)
     end if

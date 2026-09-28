@@ -266,9 +266,26 @@ optional true
 longname do not add rows to the solution matrix
 description keyword that solves the feature concentration with a general mixing equation and adds the result to the right-hand side of the GWT equations, instead of adding a row to the solution matrix for each feature.  This development option is not supported.
 
+block options
+name sorption
+type string
+valid linear freundlich langmuir
+reader urword
+optional true
+longname activate solid-phase sorption in the unsaturated zone
+description is a text keyword to indicate that solid-phase sorption will be activated in the unsaturated zone.  Valid sorption options include LINEAR, FREUNDLICH, and LANGMUIR.  If sorption is specified as LINEAR then the linear sorption isotherm is used.  If sorption is specified as FREUNDLICH or LANGMUIR then the Freundlich or Langmuir nonlinear isotherms are used, respectively -- NOT YET IMPLEMENTED as of this row; the run terminates with an error naming this rather than computing silently wrong retardation.  Requires BULK_DENSITY, DISTCOEF, and POR in the PACKAGEDATA block.  Retardation is applied by scaling the stored water volume by R = 1 + bulk_density*distcoef/theta, matching MT3D-USGS equation 25 (TM 6-A53), and is evaluated at the current water content each timestep.
+
+block options
+name awi_sorption
+type keyword
+reader urword
+optional true
+longname activate air-water interfacial sorption in the unsaturated zone
+description is a text keyword to indicate that air-water interfacial (AWI) sorption will be activated in the unsaturated zone.  This is an additive retardation term, R += (a_aw/theta)*kaw, with a_aw = 6*(1-por)*(1-sw)/d50 and sw = theta/por -- the interfacial area per unit volume for a PFAS-relevant mechanism absent from released MODFLOW 6 and MT3D-USGS alike.  Requires KAW, D50 and POR in the PACKAGEDATA block.  Can be combined with SORPTION or used on its own (solid-phase sorption off, AWI only).
+
 block packagedata
 name packagedata
-type recarray ifno strt aux boundname
+type recarray ifno strt por thtr bulk_density distcoef sp2 kaw d50 aux boundname
 shape (maxbound)
 reader urword
 longname
@@ -294,6 +311,83 @@ in_record true
 reader urword
 longname starting UZF cell concentration
 description real value that defines the starting concentration for the unsaturated zone flow cell.
+
+block packagedata
+name thtr
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname residual water content
+description real value that defines the residual water content for this UZF cell, matching the THTR supplied to the UZF package.  Present ONLY when SORPTION or AWI_SORPTION is specified in the OPTIONS block.  It exists to make the water-content convention EXPLICIT rather than inherited: the volume this package receives from the flow model is the MOBILE water volume (gwf-uzf.f90 computes it as thick*(wcnew - thtr)*area and labels it "mobile water volume"), so theta_mobile = volume/cell_volume and THTR is added back to obtain the TOTAL volumetric water content.  Retardation is divided by TOTAL water content, because equilibrium sorption partitions against all aqueous water in contact with the solid -- residual water is still aqueous and still touching the grains -- and because total water content is the convention of MT3D-USGS equation 24, without which a cross-code comparison disagrees by theta/(theta-thtr) for a purely definitional reason.  Supplying 0.0 here reproduces the mobile-water convention.
+
+block packagedata
+name bulk_density
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname solid-phase bulk density of the unsaturated zone material
+description real value that defines the bulk density of the unsaturated-zone solid for this UZF cell.  Only used when SORPTION is active in the OPTIONS block; otherwise ignored (a placeholder value, e.g. 0.0, is still required on every PACKAGEDATA line).  MODFLOW 6 performs NO internal unit conversion on this value -- it is multiplied directly against DISTCOEF (see mst_fc_srb / this package's uzt_retardation), so the units of BULK_DENSITY and DISTCOEF must already be mutually consistent (e.g. kg/m3 with m3/kg, or kg/L with L/kg -- never mix the two systems).  Present ONLY when SORPTION is specified in the OPTIONS block; omitted entirely otherwise, so existing UZT input files without SORPTION remain valid and are read byte-identically to previous MODFLOW 6 versions.
+
+block packagedata
+name distcoef
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname Kd distribution coefficient
+description real value that defines the solid-water distribution coefficient (Kd) for linear sorption in the unsaturated zone for this UZF cell.  Only used when SORPTION is active; otherwise ignored (placeholder required).  See BULK_DENSITY for the unit-consistency requirement -- this field is not independently converted.  Present ONLY when SORPTION is specified in the OPTIONS block.
+
+block packagedata
+name sp2
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname second sorption isotherm parameter, reserved
+description real value reserved for the second isotherm parameter (Freundlich exponent or Langmuir sorption maximum) once nonlinear SORPTION is implemented.  Currently unused by LINEAR sorption; a placeholder value is still required on every PACKAGEDATA line.  Present ONLY when SORPTION is specified in the OPTIONS block.
+
+block packagedata
+name por
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname total porosity of the unsaturated zone material
+description real value that defines the total porosity for this UZF cell.  Required (and must be > 0) whenever SORPTION or AWI_SORPTION is active -- it is the denominator in R's solid-phase term and is also used to derive water saturation Sw = theta/por for the AWI term.  Otherwise ignored (placeholder required).  Present ONLY when SORPTION or AWI_SORPTION is specified in the OPTIONS block.
+
+block packagedata
+name kaw
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname air-water interfacial partition coefficient
+description real value that defines the air-water interfacial (AWI) partition coefficient for this UZF cell.  Only used when AWI_SORPTION is active; otherwise ignored (placeholder required).  Combines with the interfacial area term a_aw (see D50) to add (a_aw/theta)*KAW to the retardation factor -- the PFAS-specific mechanism absent from released MODFLOW 6 and MT3D-USGS.  Present ONLY when AWI_SORPTION is specified in the OPTIONS block.
+
+block packagedata
+name d50
+type double precision
+shape
+tagged false
+in_record true
+reader urword
+optional true
+longname median grain diameter
+description real value that defines the median grain diameter for this UZF cell, used to compute the air-water interfacial area per unit volume a_aw = 6*(1-por)*(1-sw)/d50.  Required (and must be > 0) whenever AWI_SORPTION is active; otherwise ignored (placeholder required).  Present ONLY when AWI_SORPTION is specified in the OPTIONS block.
 
 block packagedata
 name aux

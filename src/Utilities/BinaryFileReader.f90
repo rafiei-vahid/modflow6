@@ -7,7 +7,14 @@ module BinaryFileReaderModule
   public :: BinaryFileHeaderType, BinaryFileReaderType
 
   type :: BinaryFileHeaderType
-    integer(I4B) :: pos, size
+    ! (patch 0009): file POSITION and record SIZE are I8B, not I4B. A position held in
+    ! int32 cannot exceed 2,147,483,647 = 2 GiB - 1, and %pos is the seek-back target used by
+    ! peek_record below (inquire at :114, read(pos=) at :117). Past the boundary the saved
+    ! position is not representable, the seek-back lands mid-record, and the next header read
+    ! takes real data as kstp/kper/budtxt/imeth -- the observed INVALID METHOD CODE with a
+    ! half-mangled record name. %size is a per-record difference and small, but it is computed
+    ! as (pos - header%pos) and is widened with it so the arithmetic stays in one kind.
+    integer(I8B) :: pos, size
     integer(I4B) :: kper, kstp
     real(DP) :: pertim, totim
   contains
@@ -19,7 +26,7 @@ module BinaryFileReaderModule
     integer(I4B) :: nrecords
     logical(LGP) :: indexed
     logical(LGP) :: endoffile
-    integer(I4B), allocatable :: record_sizes(:)
+    integer(I8B), allocatable :: record_sizes(:)  ! (patch 0009): accumulates %size at :100
     class(BinaryFileHeaderType), allocatable :: header
     class(BinaryFileHeaderType), allocatable :: headernext
   contains
@@ -69,7 +76,7 @@ contains
     class(BinaryFileReaderType), intent(inout) :: this
     ! local
     logical(LGP) :: success
-    integer(I4B) :: pos, record_size
+    integer(I8B) :: pos, record_size  ! (patch 0009): receives inquire(pos=) at :97
 
     this%indexed = .false.
     this%nrecords = 0
