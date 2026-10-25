@@ -1280,7 +1280,9 @@ contains
     if (node > 0) sat1 = this%fmi%gwfsat(node)
     cap = this%uzt_capacity(n1, v1, sat1)
     !
-    if (cap > DZERO) then
+    ! -- B2 (Lane C, 2026-10-21): a feature that nearly dries in the step (v1 < 1e-3 * v0) takes the implicit branch
+    !    below (hcofval = qbnd, as in stock MF6); every other row with capacity keeps patch 0007's explicit removal.
+    if (cap > DZERO .and. v1 >= 1.0d-3 * v0) then
       if (present(rrate)) rrate = ctmp * qbnd
       if (present(rhsval)) rhsval = -qbnd * ctmp
       if (present(hcofval)) hcofval = DZERO
@@ -1395,7 +1397,9 @@ contains
     if (node > 0) sat1 = this%fmi%gwfsat(node)
     cap = this%uzt_capacity(n1, v1, sat1)
     !
-    if (cap > DZERO) then
+    ! -- B2 (Lane C, 2026-10-21): a feature that nearly dries in the step (v1 < 1e-3 * v0) takes the implicit branch
+    !    below (hcofval = qbnd, as in stock MF6); every other row with capacity keeps patch 0007's explicit removal.
+    if (cap > DZERO .and. v1 >= 1.0d-3 * v0) then
       if (present(rrate)) rrate = ctmp * qbnd
       if (present(rhsval)) rhsval = -qbnd * ctmp
       if (present(hcofval)) hcofval = DZERO
