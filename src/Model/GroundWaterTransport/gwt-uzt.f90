@@ -115,6 +115,8 @@ module GwtUztModule
 
   end type GwtUztType
 
+  integer(I4B), save :: h4_ncall = 0 !< H4 debug (Lane C, 2026-10-21): rinf calls counted in SP 1 ts 1
+
 contains
 
   !> @brief Create a new UZT package
@@ -1235,7 +1237,7 @@ contains
   !<
   subroutine uzt_rinf_term(this, ientry, n1, n2, rrate, &
                            rhsval, hcofval)
-    use TdisModule, only: delt
+    use TdisModule, only: delt, kper, kstp
     ! -- dummy
     class(GwtUztType) :: this
     integer(I4B), intent(in) :: ientry
@@ -1279,6 +1281,16 @@ contains
     sat1 = DZERO
     if (node > 0) sat1 = this%fmi%gwfsat(node)
     cap = this%uzt_capacity(n1, v1, sat1)
+    ! -- H4 debug (Lane C, 2026-10-21; prints only, no arithmetic change): the FIRST fill of SP 1 ts 1
+    if (kper == 1 .and. kstp == 1) then
+      h4_ncall = h4_ncall + 1
+      if (h4_ncall <= this%flowbudptr%budterm(this%idxbudrinf)%nlist) then
+        if (cap > DZERO .and. qbnd /= DZERO) then
+          write (this%iout, '(a,i9,6(1x,es16.8))') ' H4DBG ', n1, v0, v1, cap, qbnd, &
+            this%xoldpak(n1), this%concinfl(n1)
+        end if
+      end if
+    end if
     !
     if (cap > DZERO) then
       if (present(rrate)) rrate = ctmp * qbnd
