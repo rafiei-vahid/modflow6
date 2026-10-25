@@ -1280,7 +1280,9 @@ contains
     if (node > 0) sat1 = this%fmi%gwfsat(node)
     cap = this%uzt_capacity(n1, v1, sat1)
     !
-    if (cap > DZERO) then
+    ! -- B1 (Lane C, 2026-10-21): with sorption off the rejected water leaves through the matrix, as in stock MF6
+    !    (hcofval = qbnd); patch 0007's explicit removal at concinfl is kept only when sorption is on.
+    if (cap > DZERO .and. (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1)) then
       if (present(rrate)) rrate = ctmp * qbnd
       if (present(rhsval)) rhsval = -qbnd * ctmp
       if (present(hcofval)) hcofval = DZERO
@@ -1395,7 +1397,9 @@ contains
     if (node > 0) sat1 = this%fmi%gwfsat(node)
     cap = this%uzt_capacity(n1, v1, sat1)
     !
-    if (cap > DZERO) then
+    ! -- B1 (Lane C, 2026-10-21): with sorption off the rejected water leaves through the matrix, as in stock MF6
+    !    (hcofval = qbnd); patch 0007's explicit removal at concinfl is kept only when sorption is on.
+    if (cap > DZERO .and. (this%isrb /= SORPTION_OFF .or. this%iawisrb == 1)) then
       if (present(rrate)) rrate = ctmp * qbnd
       if (present(rhsval)) rhsval = -qbnd * ctmp
       if (present(hcofval)) hcofval = DZERO
